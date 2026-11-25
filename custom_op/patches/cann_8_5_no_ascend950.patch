@@ -1,0 +1,13 @@
+--- a/common/src/tiling_base/tiling_util.cpp
++++ b/common/src/tiling_base/tiling_util.cpp
+@@ -22,8 +22,7 @@ static const gert::Shape g_vec_1_shape = {1};
+ 
+ static bool IsRegbaseSocVersion(platform_ascendc::SocVersion version)
+ {
+-    const static std::set<platform_ascendc::SocVersion> regbaseSocVersions = {
+-        platform_ascendc::SocVersion::ASCEND950};
++    const static std::set<platform_ascendc::SocVersion> regbaseSocVersions = {};
+ 
+     return regbaseSocVersions.find(version) != regbaseSocVersions.end();
+ }
+

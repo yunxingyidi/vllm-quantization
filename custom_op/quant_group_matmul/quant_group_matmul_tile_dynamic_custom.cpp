@@ -1,0 +1,22 @@
+// Experimental tile-level dynamic fusion entry.
+//
+// Keep this file as a thin wrapper at first: it reuses the current stable
+// implementation but exports a separate kernel symbol. Future true-fusion
+// changes should happen here, leaving quant_group_matmul_custom.cpp as the
+// stable baseline.
+#define quant_group_matmul_custom quant_group_matmul_tile_baseline_custom
+#define quant_group_matmul_dynamic_custom quant_group_matmul_tile_dynamic_workspace_custom
+#define quant_group_matmul_workspace_passthrough_dynamic_custom quant_group_matmul_tile_workspace_passthrough_dynamic_custom
+#define quant_group_matmul_passthrough_dynamic_custom quant_group_matmul_tile_passthrough_dynamic_custom
+#define quant_group_matmul_external_dynamic_custom quant_group_matmul_tile_dynamic_custom
+#define quant_group_dynamic_pack_custom quant_group_tile_dynamic_pack_custom
+#define quant_group_dynamic_pack_aic_read_custom quant_group_tile_dynamic_pack_aic_read_custom
+#define quant_group_tile_workspace_roundtrip_custom quant_group_tile_dynamic_workspace_roundtrip_custom
+#define quant_group_tile_matmul_compare_custom quant_group_tile_dynamic_matmul_compare_custom
+#define quant_group_shared_tile_pack_debug_custom quant_group_tile_shared_pack_debug_custom
+#define quant_group_tile_dynamic_pack_debug_custom quant_group_tile_dynamic_pack_debug_tile_custom
+#define GROUP_QUANT_DYNAMIC_PACK_FN TileDynamicQuantizeKGroupedToWorkspaceDataCopy
+#define GROUP_QUANT_TILE_DYNAMIC_EXPERIMENT 1
+#define GROUP_QUANT_TILE_DYNAMIC_LOCAL_INPUTS 1
+
+#include "quant_group_matmul_custom.cpp"

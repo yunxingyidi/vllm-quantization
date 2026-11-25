@@ -1,0 +1,77 @@
+# Local tools, editors and operating-system files
+/.codex/
+/.vscode/
+/.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Local credentials; keep distributable environment examples
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python environments, caches and packaging outputs
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+*.whl
+
+# Rebuildable native operator outputs (keep CMake/source directories)
+/custom_op/build_root/
+/custom_op/build/
+/custom_op/*/build/
+/custom_op/*/dist/
+/custom_op/*/out/
+/custom_op/**/docs/perf/
+/tests/custom_op/*/build/
+*.so
+*.so.*
+*.o
+*.a
+/custom_op/**/input/*.bin
+/custom_op/**/output/*.bin
+
+# Model weights, local datasets and exported models
+/models/
+/weights/
+/datasets/
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.om
+
+# Benchmark results and generated reporting materials
+/tests/artifacts/*
+!/tests/artifacts/README.md
+/docs/performance_analysis/
+/docs/reports/
+/*.docx
+/*.pptx
+/*.pdf
+*.log
+
+# Ascend compilation/profiling metadata
+kernel_meta/
+/prof_result/
+fusion_result.json
+profiler_info.json
+profiler_info_*.json
