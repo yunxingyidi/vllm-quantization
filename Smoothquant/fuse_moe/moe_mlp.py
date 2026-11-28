@@ -101,6 +101,8 @@ def _require_single_tensor_for_swiglu_quant(
 def _normalize_pertoken_scale(scale: torch.Tensor) -> torch.Tensor:
     if scale.dim() == 2 and scale.size(-1) == 1:
         scale = scale.squeeze(-1)
+    if scale.dtype == torch.float32 and scale.is_contiguous():
+        return scale
     return scale.contiguous().to(torch.float32)
 
 
@@ -546,6 +548,32 @@ def _expert_gmm2_storage_key(
     )
 
 
+def _use_bf16_expert_gmm2_scale(e: torch.Tensor | list[torch.Tensor]) -> bool:
+    first_e = e[0] if isinstance(e, list) and e else e
+    return (
+        isinstance(first_e, torch.Tensor)
+        and first_e.ndim > 0
+        and first_e.shape[-1] == 1
+        and os.getenv("GROUP_QUANT_GMM2_LOCAL_INT32", "0") == "0"
+        and os.getenv("GROUP_QUANT_GMM2_BF16_WEIGHT_SCALE", "1") != "0"
+    )
+
+
+def _pack_expert_gmm2_scale(
+    delta_base: torch.Tensor,
+    e: torch.Tensor,
+    residual_bits: int,
+    *,
+    use_bf16_scale: bool,
+) -> torch.Tensor:
+    scales = [
+        _group_weight_scale(delta, exponent, residual_bits, use_moe=True).transpose(0, 1)
+        for delta, exponent in zip(delta_base.unbind(0), e.unbind(0), strict=True)
+    ]
+    packed = torch.cat(scales, dim=0).contiguous()
+    return packed if use_bf16_scale else packed.to(torch.float32)
+
+
 def _prepare_expert_gmm2_weight(
     weight_q: torch.Tensor | list[torch.Tensor],
     delta_base: torch.Tensor | list[torch.Tensor],
@@ -553,9 +581,10 @@ def _prepare_expert_gmm2_weight(
     residual_bits: int,
     group_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    use_bf16_scale = _use_bf16_expert_gmm2_scale(e)
     key = _expert_gmm2_pack_key(
         weight_q, delta_base, e, residual_bits, group_size
-    )
+    ) + (use_bf16_scale,)
     storage_key = _expert_gmm2_storage_key(
         weight_q, delta_base, e, residual_bits, group_size
     )
@@ -619,16 +648,9 @@ def _prepare_expert_gmm2_weight(
                 for expert_idx in range(normalized_weight_q.shape[0])
             ]
         ).contiguous()
-    scales = []
-    for expert_idx in range(normalized_delta_base.shape[0]):
-        scale = _group_weight_scale(
-            normalized_delta_base[expert_idx],
-            normalized_e[expert_idx],
-            residual_bits,
-            use_moe=True,
-        )
-        scales.append(scale.transpose(0, 1))
-    packed_scale = torch.cat(scales, dim=0).contiguous().to(torch.float32)
+    packed_scale = _pack_expert_gmm2_scale(
+        normalized_delta_base, normalized_e, residual_bits, use_bf16_scale=use_bf16_scale
+    )
     result = (packed_weight, packed_scale)
     _EXPERT_GMM2_PACK_CACHE[key] = result
     _EXPERT_GMM2_STORAGE_TO_PACK_KEY[storage_key] = key
@@ -657,30 +679,25 @@ def _group_quant_expert_matmul_custom(
     group_list_type: int,
     output_dtype: torch.dtype,
     input_scale: torch.Tensor | None = None,
-    expert_counts: torch.Tensor | None = None,
+    prepacked_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run GMM2 as one expert-aware kernel launch."""
     global _EXPERT_GMM2_SHAPE_LOG_CALLS
-    first_delta = _select_expert_tensor(
-        delta_base, 0, name="delta_base", expert_first_dim=True
-    )
-    first_e = _select_expert_tensor(
-        e, 0, name="e", expert_first_dim=True
-    )
-    expert_num = _expert_count_from_group_quant_metadata(
-        delta_base, e, name="GMM2"
-    )
-    if first_delta.dim() != 1 or first_e.dim() != 2:
-        raise ValueError("GMM2 per-expert delta_base/e must be [N] and [N,G].")
-    output_size = first_delta.shape[0]
-    input_size = first_e.shape[-1] * group_size
+    if prepacked_scale is not None:
+        expert_num, output_size, k_groups = e.shape
+    else:
+        first_delta = _select_expert_tensor(
+            delta_base, 0, name="delta_base", expert_first_dim=True
+        )
+        first_e = _select_expert_tensor(e, 0, name="e", expert_first_dim=True)
+        expert_num = _expert_count_from_group_quant_metadata(delta_base, e, name="GMM2")
+        if first_delta.dim() != 1 or first_e.dim() != 2:
+            raise ValueError("GMM2 per-expert delta_base/e must be [N] and [N,G].")
+        output_size = first_delta.shape[0]
+        k_groups = first_e.shape[-1]
     if x.shape[0] == 0:
         return torch.empty(
             (0, output_size), device=x.device, dtype=output_dtype
-        )
-    if input_size % group_size != 0:
-        raise ValueError(
-            f"Input size {input_size} must be divisible by group_size {group_size}."
         )
     _load_expert_gmm2_op()
     if input_scale is None or x.dtype != torch.int8:
@@ -689,49 +706,61 @@ def _group_quant_expert_matmul_custom(
         # Rank 3 identifies native row-major input without copying group slices.
         # Keep the old rank-2 contract for comparisons and the local-int32 trial.
         use_nd = (
-            input_size > group_size
+            k_groups > 1
             and os.getenv("GROUP_QUANT_GMM2_ND_INPUT", "1") != "0"
             and os.getenv("GROUP_QUANT_GMM2_LOCAL_INT32", "0") == "0"
         )
         if use_nd:
             x_q_packed = x.contiguous().view(x.shape[0], -1, group_size)
+        elif x.ndim == 2 and x.shape[1] == group_size:
+            x_q_packed = x
         else:
             x_q_packed = _pack_grouped_activation_q(x.contiguous(), group_size)
-        x_scale = _normalize_pertoken_scale(input_scale).reshape(-1)
+        x_scale = _normalize_pertoken_scale(input_scale)
+        if x_scale.ndim != 1:
+            x_scale = x_scale.reshape(-1)
         if x_scale.numel() != x.shape[0]:
             raise ValueError(
                 f"GMM2 per-token activation scale must have {x.shape[0]} "
                 f"elements, but got {x_scale.numel()}."
             )
-    packed_weight, packed_scale = _prepare_expert_gmm2_weight(
-        weight_q, delta_base, e, residual_bits, group_size
-    )
-    if expert_counts is None:
-        cumulative_groups = cumsum_group_list(
+    if prepacked_scale is None:
+        packed_weight, packed_scale = _prepare_expert_gmm2_weight(
+            weight_q, delta_base, e, residual_bits, group_size
+        )
+    else:
+        packed_weight, packed_scale = weight_q, prepacked_scale
+    if group_list_type == 2:
+        group_list = cumsum_group_list(
             group_list,
             group_list_type,
             0,
             active_num=x.shape[0],
             expert_num=expert_num,
         )
-        expert_counts = cumsum_group_list(cumulative_groups, 0, 1)
-    # The fused GMM1 path already materializes this exact routing form for its
-    # TensorList ABI.  Reusing it avoids a second device-side cumsum/cast and
-    # gives the future single-launch GMM1->GMM2 operator one stable routing
-    # contract: cumulative counts for GMM1, per-expert counts for GMM2.
-    expert_counts = expert_counts.contiguous().to(torch.int64)
-    if expert_counts.numel() != expert_num:
+        group_list_type = 0
+    cumulative = (
+        group_list_type == 0
+        and os.getenv("GROUP_QUANT_GMM2_CUMULATIVE_ROUTING", "1") == "1"
+    )
+    if not cumulative:
+        group_list = cumsum_group_list(group_list, group_list_type, 1)
+    if group_list.dtype != torch.int64 or not group_list.is_contiguous():
+        group_list = group_list.contiguous().to(torch.int64)
+    if group_list.numel() != expert_num:
         raise ValueError(
-            f"GMM2 expert_counts must have {expert_num} elements, got "
-            f"{expert_counts.numel()}."
+            f"GMM2 group_list must have {expert_num} elements, got "
+            f"{group_list.numel()}."
         )
     shape_log_limit = int(os.getenv("GROUP_QUANT_GMM2_SHAPE_LOG", "0"))
     if _EXPERT_GMM2_SHAPE_LOG_CALLS < shape_log_limit:
-        counts_cpu = expert_counts.cpu()
+        counts_cpu = group_list.cpu()
+        if cumulative:
+            counts_cpu = cumsum_group_list(counts_cpu, 0, 1)
         nonzero = counts_cpu[counts_cpu > 0]
         print(
             "GroupQuant GMM2 shape: "
-            f"M={x.shape[0]}, K={input_size}, N={output_size}, E={expert_num}, "
+            f"M={x.shape[0]}, K={k_groups * group_size}, N={output_size}, E={expert_num}, "
             f"active_experts={nonzero.numel()}, "
             f"expert_m_min={int(nonzero.min()) if nonzero.numel() else 0}, "
             f"expert_m_max={int(nonzero.max()) if nonzero.numel() else 0}, "
@@ -739,13 +768,15 @@ def _group_quant_expert_matmul_custom(
             flush=True,
         )
         _EXPERT_GMM2_SHAPE_LOG_CALLS += 1
-    out = torch.ops._C_ascend.quant_matmul_expert_k_grouped(
+    op_args = (
         x_q_packed.contiguous(),
         packed_weight,
-        expert_counts,
+        group_list,
         packed_scale,
-        x_scale.contiguous().to(torch.float32),
+        x_scale,
     )
+    op = torch.ops._C_ascend.quant_matmul_expert_k_grouped
+    out = op(*op_args, cumulative_group_list=True) if cumulative else op(*op_args)
     # GMM2 writes BF16 directly.  Keep the common BF16 inference path free of
     # the former FP16 -> BF16 cast; only non-BF16 callers need a compatibility
     # conversion after the custom operator.
@@ -793,6 +824,8 @@ def group_quant_apply_mlp(
     per_token_scale_type: torch.dtype | None = None,
     use_bf16: bool = True,
     swiglu_limit: float = 0.0,
+    w2_packed_scale: torch.Tensor | None = None,
+    k_group_sizes: tuple[int, int] | None = None,
 ) -> tuple[torch.Tensor, torch.npu.Event | None]:
     """Apply MoE MLP with GroupQuant weights and fused kernels when available.
 
@@ -809,8 +842,11 @@ def group_quant_apply_mlp(
     if group_quant_residual_bits is None or group_quant_group_size is None:
         raise ValueError("GroupQuant MoE requires residual_bits and group_size runtime metadata.")
 
-    w1_group_size = _infer_group_size_from_quant_state(w1, w1_weight_e)
-    w2_group_size = _infer_group_size_from_quant_state(w2, w2_weight_e)
+    if k_group_sizes is None:
+        w1_group_size = _infer_group_size_from_quant_state(w1, w1_weight_e)
+        w2_group_size = _infer_group_size_from_quant_state(w2, w2_weight_e)
+    else:
+        w1_group_size, w2_group_size = k_group_sizes
 
     act_name = getattr(activation, "value", activation)
     matmul_output_dtype = torch.bfloat16 if use_bf16 else torch.float16
@@ -823,10 +859,7 @@ def group_quant_apply_mlp(
     if act_name not in (None, "silu"):
         raise NotImplementedError(f"GroupQuant MoE path only supports silu/SwiGLU, got {act_name}.")
 
-    # This is deliberately kept outside the fused-GMM1 branch.  The upcoming
-    # single-launch GMM1->GMM2 kernel consumes the same two routing views; a
-    # non-fused caller must continue to use the existing conversion path.
-    gmm2_expert_counts: torch.Tensor | None = None
+    cumulative_groups: torch.Tensor | None = None
     # The loading contract identifies native GMM1 without inspecting device
     # values: a complete [E,K,N] NZ tensor plus FP32 [E,N] channel scales.
     # Custom/grouped/EPLB weights retain their TensorList + packed-scale ABI.
@@ -858,7 +891,6 @@ def group_quant_apply_mlp(
             group_list, group_list_type, 0,
             active_num=hidden_states.shape[0], expert_num=w1.shape[0],
         )
-        gmm2_expert_counts = cumsum_group_list(cumulative_groups, 0, 1)
         hidden_states, w2_input_scale, _ = torch_npu.npu_grouped_matmul_swiglu_quant(
             hidden_states, w1, cumulative_groups, w1_fixpipe_scale, pertoken_scale,
         )
@@ -903,7 +935,6 @@ def group_quant_apply_mlp(
                 w1_weight_delta_base, w1_weight_e, name="GMM1"
             ),
         )
-        gmm2_expert_counts = cumsum_group_list(cumulative_groups, 0, 1)
         # Derive TP-local N from the weight, not from scale.numel(): grouped
         # quantization scales may carry an additional K-group dimension and
         # must not be mistaken for a wider output tensor.
@@ -1099,6 +1130,14 @@ def group_quant_apply_mlp(
             output_dtype=matmul_output_dtype,
         )[0].to(final_output_dtype)
     elif use_expert_gmm2_op:
+        # Reuse the dense prefix sums when fused GMM1 expanded a sparse list.
+        if (
+            group_list_type == 2
+            and cumulative_groups is not None
+            and w2_input_scale is not None
+        ):
+            group_list = cumulative_groups
+            group_list_type = 0
         hidden_states = _group_quant_expert_matmul_custom(
             hidden_states,
             weight_q=w2,
@@ -1110,11 +1149,7 @@ def group_quant_apply_mlp(
             group_list_type=group_list_type,
             input_scale=w2_input_scale,
             output_dtype=matmul_output_dtype,
-            # Only the custom fused GMM1 path has produced the compatible
-            # route table above.  The fallback path preserves its original
-            # independent routing conversion.
-            expert_counts=(gmm2_expert_counts
-                           if w2_input_scale is not None else None),
+            prepacked_scale=w2_packed_scale,
         )
         if hidden_states.dtype != final_output_dtype:
             hidden_states = hidden_states.to(final_output_dtype)

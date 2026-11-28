@@ -42,14 +42,19 @@ scale 的完整精度覆盖。
 torch.ops._C_ascend.quant_matmul_expert_k_grouped(
     x_int8,          # packed [G*M, S] or ND [M, G, S], int8
     weight_nz_int8,  # [E * G * N * group_size], int8 packed NZ
-    group_list,      # [E], int64 expert token counts
-    weight_scale,    # [E * G, N], float32
+    group_list,      # [E], int64
+    weight_scale,    # [E * G, N], float32 or bfloat16
     x_scale,         # [M], float32, native per-token activation scale
+    cumulative_group_list=False,
 ) -> y              # [M, N], bfloat16 (native kernel output)
 ```
 
-其中 `E` 为 expert 数，`G` 为 K-group 数。`group_list` 使用每 expert token 数，
-不是累计 token 数。activation 使用 per-token 量化，因此所有 K group 复用同一个
+其中 `E` 为 expert 数，`G` 为 K-group 数。`group_list` 默认接收逐 expert token 数，
+也可通过 `cumulative_group_list=True` 接收累计行结束位置。累计表以 0 为隐式起点，
+数值单调不减，最后一项等于 M。相同的相邻值表示空 expert。
+GroupQuant 默认把路由已产生的累计表直接传给 GMM2。可设置
+`GROUP_QUANT_GMM2_CUMULATIVE_ROUTING=0` 测试原逐 expert 计数路径。
+activation 使用 per-token 量化，因此所有 K group 复用同一个
 `x_scale[m]`；只有 weight scale 沿 K 轴按 group 区分。
 
 ### 直接 ND 输入
@@ -89,9 +94,19 @@ directly, avoiding a SONAME collision with the custom-op library bundled in
 newer vLLM-Ascend wheels.
 
 如 adapter 不在默认构建目录，可通过
-`GROUP_QUANT_EXPERT_GMM2_LIBRARY=/absolute/path/to/adapter.so` 指定。新路径在首次
-调用时预打包静态 W2 权重和 scale，之后按 tensor 地址和版本复用；缓存容量默认 128，
-可用 `GROUP_QUANT_EXPERT_GMM2_CACHE_SIZE` 调整。
+`GROUP_QUANT_EXPERT_GMM2_LIBRARY=/absolute/path/to/adapter.so` 指定。采用结构化
+MoE 接口且 expert 固定的模型在加载时准备 W2 权重和 scale，前向直接复用。
+启动前可设置 `GROUP_QUANT_GMM2_PREPACK_SCALE=0` 对照运行时缓存路径。
+动态 EPLB 和直接调用仍按 tensor 地址和版本复用缓存，默认容量 128，可用
+`GROUP_QUANT_EXPERT_GMM2_CACHE_SIZE` 调整。
+
+固定 expert 的结构化 MoE 路径也在加载时准备权重参数和两段 GMM 各自的 K-group
+大小。启动前可设置 `GROUP_QUANT_MOE_STATIC_METADATA=0`，对照逐次构造参数和从
+权重张量推导 K-group 的执行路径。
+
+910C 小批 AllGather 路由在 GMM 前准备输出还原索引。没有 shared expert 事件消费者
+的原生 MoE 层在 GMM2 后直接提交 unpermute。启动前设置
+`GROUP_QUANT_MOE_EARLY_COMBINE_PREP=0` 可复测原提交顺序。
 
 ## 精度与性能对比
 

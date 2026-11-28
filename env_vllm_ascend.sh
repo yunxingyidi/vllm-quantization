@@ -17,22 +17,34 @@ _env_vllm_ascend_require_file() {
     local label="$2"
     if [[ ! -f "${path}" ]]; then
         echo "Missing ${label}: ${path}" >&2
-        _env_vllm_ascend_finish 1
+        return 1
     fi
 }
 
 _env_vllm_ascend_main() {
     local conda_root="${HOME}/miniconda3"
-    local conda_env_name="${CONDA_ENV_NAME:-vllm}"
-    local cann_home="${CANN_HOME:-${HOME}/Ascend/cann-8.5.1}"
-    local atb_home="${ATB_HOME:-${HOME}/Ascend/nnal/atb/8.5.1/atb}"
+    local default_conda_env=vllm
+    local default_cann_home="${HOME}/Ascend/cann-8.5.1"
+    local default_atb_home="${HOME}/Ascend/nnal/atb/8.5.1/atb"
+    if [[ ! -d "${conda_root}/envs/vllm/conda-meta" && -d "${conda_root}/envs/vllmq/conda-meta" ]]; then
+        default_conda_env=vllmq
+    fi
+    if [[ ! -f "${default_cann_home}/set_env.sh" && -f "${HOME}/Ascend/cann/set_env.sh" ]]; then
+        default_cann_home="${HOME}/Ascend/cann"
+    fi
+    if [[ ! -f "${default_atb_home}/set_env.sh" && -f "${HOME}/Ascend/nnal/atb/set_env.sh" ]]; then
+        default_atb_home="${HOME}/Ascend/nnal/atb"
+    fi
+    local conda_env_name="${CONDA_ENV_NAME:-${default_conda_env}}"
+    local cann_home="${CANN_HOME:-${default_cann_home}}"
+    local atb_home="${ATB_HOME:-${default_atb_home}}"
     local asdsip_home="${ASDSIP_HOME:-${HOME}/Ascend/nnal/asdsip}"
     local atb_cxx_abi="${ATB_CXX_ABI:-0}"
 
-    _env_vllm_ascend_require_file "${conda_root}/etc/profile.d/conda.sh" "conda init script"
-    _env_vllm_ascend_require_file "${cann_home}/set_env.sh" "CANN env script"
-    _env_vllm_ascend_require_file "${atb_home}/set_env.sh" "ATB env script"
-    _env_vllm_ascend_require_file "${asdsip_home}/set_env.sh" "ASDSIP env script"
+    _env_vllm_ascend_require_file "${conda_root}/etc/profile.d/conda.sh" "conda init script" || return 1
+    _env_vllm_ascend_require_file "${cann_home}/set_env.sh" "CANN env script" || return 1
+    _env_vllm_ascend_require_file "${atb_home}/set_env.sh" "ATB env script" || return 1
+    _env_vllm_ascend_require_file "${asdsip_home}/set_env.sh" "ASDSIP env script" || return 1
 
     # Ascend env scripts access unset shell variables internally, so avoid
     # propagating nounset/errexit from the caller into those sourced scripts.

@@ -4,8 +4,15 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_ROOT=$(cd "${SCRIPT_DIR}/../../.." && pwd)
 PROJECT_DIR="${REPO_ROOT}/custom_op/gmm1_vecin_fullk"
-CANN_PATH=${ASCEND_HOME_PATH:-/home/zhangtairan/Ascend/cann-8.5.1}
-VENDOR_DIR=${GMM1_VENDOR_DIR:-${CANN_PATH}/opp/vendors/custom_transformer}
+DEFAULT_CANN_PATH="${HOME}/Ascend/cann"
+if [[ ! -d "${DEFAULT_CANN_PATH}" ]]; then
+    DEFAULT_CANN_PATH="${HOME}/Ascend/cann-8.5.1"
+fi
+CANN_PATH=${ASCEND_HOME_PATH:-${CANN_HOME:-${DEFAULT_CANN_PATH}}}
+VENDOR_DIR=${GMM1_VENDOR_DIR:-${REPO_ROOT}/custom_op/build_root/install/vendors/custom_transformer}
+if [[ -z "${GMM1_VENDOR_DIR:-}" && ! -d "${VENDOR_DIR}" ]]; then
+    VENDOR_DIR="${CANN_PATH}/opp/vendors/custom_transformer"
+fi
 OPAPI_DIR=${GMM1_OPAPI_DIR:-${VENDOR_DIR}/op_api/lib}
 OPP_PATH=${GMM1_OPP_PATH:-${VENDOR_DIR}}
 BUILD_DIR="${SCRIPT_DIR}/build"

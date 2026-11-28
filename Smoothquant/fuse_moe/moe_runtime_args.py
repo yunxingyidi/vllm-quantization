@@ -57,7 +57,7 @@ dataclass directly.
 
 from __future__ import annotations
 
-import inspect
+from inspect import signature
 
 import torch
 
@@ -79,6 +79,10 @@ from vllm_ascend.ops.fused_moe.moe_stage_params import (
     MoERoutingParams,
 )
 from vllm_ascend.quantization.quant_type import QuantType
+
+_MOE_QUANT_PARAMS_SUPPORTS_PER_CHANNEL_WEIGHT = (
+    "is_per_channel_weight" in signature(MoEQuantParams).parameters
+)
 
 
 def _build_mxfp_params(
@@ -160,6 +164,8 @@ def build_fused_experts_input(
     group_quant_residual_bits: int | None = None,
     group_quant_group_size: int | None = None,
     swiglu_limit: float = 0.0,
+    w2_packed_scale: torch.Tensor | None = None,
+    use_early_combine_prep: bool = False,
 ) -> MoEFusedExpertsInput:
     quant_kwargs = dict(
         quant_type=quant_type,
@@ -173,7 +179,7 @@ def build_fused_experts_input(
             mxfp_use_bf16=mxfp_use_bf16,
         ),
     )
-    if "is_per_channel_weight" in inspect.signature(MoEQuantParams).parameters:
+    if _MOE_QUANT_PARAMS_SUPPORTS_PER_CHANNEL_WEIGHT:
         quant_kwargs["is_per_channel_weight"] = is_per_channel_weight
     return MoEFusedExpertsInput(
         hidden_states=hidden_states,
@@ -198,6 +204,7 @@ def build_fused_experts_input(
             w2_weight_e=w2_weight_e,
             group_quant_residual_bits=group_quant_residual_bits,
             group_quant_group_size=group_quant_group_size,
+            w2_packed_scale=w2_packed_scale,
         ),
         routing=MoERoutingParams(
             expert_map=expert_map,
@@ -212,6 +219,7 @@ def build_fused_experts_input(
         dynamic_eplb=dynamic_eplb,
         quant=MoEQuantParams(**quant_kwargs),
         swiglu_limit=swiglu_limit,
+        use_early_combine_prep=use_early_combine_prep,
     )
 
 

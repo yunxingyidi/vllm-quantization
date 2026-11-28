@@ -23,8 +23,9 @@ aclnnStatus CheckParams(const aclTensor *x, const aclTensor *weight, const aclTe
     CHECK_COND(weight->GetDataType() == DataType::DT_INT8, ACLNN_ERR_PARAM_INVALID, "weight must be int8.");
     CHECK_COND(groupList->GetDataType() == DataType::DT_INT64, ACLNN_ERR_PARAM_INVALID,
                "groupList must be int64.");
-    CHECK_COND(weightScale->GetDataType() == DataType::DT_FLOAT, ACLNN_ERR_PARAM_INVALID,
-               "weightScale must be float32.");
+    const auto weightScaleType = weightScale->GetDataType();
+    CHECK_COND(weightScaleType == DataType::DT_FLOAT || weightScaleType == DataType::DT_BF16,
+               ACLNN_ERR_PARAM_INVALID, "weightScale must be float32 or bfloat16.");
     CHECK_COND(xScale->GetDataType() == DataType::DT_FLOAT, ACLNN_ERR_PARAM_INVALID,
                "xScale must be float32.");
     CHECK_COND(out->GetDataType() == DataType::DT_BF16, ACLNN_ERR_PARAM_INVALID, "out must be bfloat16.");
@@ -36,9 +37,12 @@ aclnnStatus CheckParams(const aclTensor *x, const aclTensor *weight, const aclTe
     const auto xScaleShape = xScale->GetViewShape();
     const auto outShape = out->GetViewShape();
     CHECK_COND((xShape.GetDimNum() == 2 || xShape.GetDimNum() == 3) && weightShape.GetDimNum() == 1 &&
-                   groupShape.GetDimNum() == 1 && weightScaleShape.GetDimNum() == 2 &&
+                   weightScaleShape.GetDimNum() == 2 &&
                    xScaleShape.GetDimNum() == 1 && outShape.GetDimNum() == 2,
                ACLNN_ERR_PARAM_INVALID, "invalid tensor rank.");
+    CHECK_COND(groupShape.GetDimNum() == 1 ||
+                   (groupShape.GetDimNum() == 2 && groupShape.GetDim(1) == 1),
+               ACLNN_ERR_PARAM_INVALID, "groupList must be counts [E] or cumulative ends [E,1].");
     const int64_t expertNum = groupShape.GetDim(0);
     const int64_t scaleGroups = weightScaleShape.GetDim(0);
     CHECK_COND(expertNum > 0 && scaleGroups > 0 && scaleGroups % expertNum == 0,

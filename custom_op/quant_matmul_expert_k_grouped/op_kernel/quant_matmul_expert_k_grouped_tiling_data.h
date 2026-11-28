@@ -32,8 +32,10 @@ struct QuantGroupMatmulCustomTilingData
     // 0: existing schedule, 1: experimental shared M-tile producer / N-tile consumers.
     uint32_t tileDynamicSchedule;
     uint32_t reserved0;
+    // Expert tile schedule: 0 per-expert, 1 M-outer, 2 streamed M/N, 3 batched N.
     uint32_t reserved1;
-    // bit0: dual AIV; bit1: rank-3 [M,G,S] ND activation input.
+    // bit0: dual AIV; bit1: rank-3 [M,G,S] ND activation; bit2: BF16 weight scale;
+    // bit3: group list entries give cumulative end rows.
     uint32_t reserved2;
     TCubeTiling mmTilingData;
 };

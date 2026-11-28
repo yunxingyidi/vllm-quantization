@@ -350,7 +350,7 @@ source custom_op/build_root/install/vendors/custom_transformer/bin/set_env.bash
 ### 6.2 代表正确性与性能测试
 
 ```bash
-python -m tests.test_groupquant_gmm_swiglu_op \
+python -m tests.custom_op.grouped_matmul_swiglu_quant_weight_nz_tensor_list.test_groupquant_gmm_swiglu_op \
   --m 257 --k 512 --n 256 --experts 4 \
   --group-size 128 --scale-dtype fp32 \
   --warmup 10 --iters 100
@@ -359,7 +359,7 @@ python -m tests.test_groupquant_gmm_swiglu_op \
 大矩阵：
 
 ```bash
-python -m tests.test_groupquant_gmm_swiglu_op \
+python -m tests.custom_op.grouped_matmul_swiglu_quant_weight_nz_tensor_list.test_groupquant_gmm_swiglu_op \
   --m 257 --k 4096 --n 4096 --experts 4 \
   --group-size 128 --scale-dtype fp32 \
   --warmup 10 --iters 100

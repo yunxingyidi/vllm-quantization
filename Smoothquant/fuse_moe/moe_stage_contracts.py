@@ -61,6 +61,8 @@ class MoEWeights:
     w2_weight_e: torch.Tensor | list[torch.Tensor] | None = None
     group_quant_residual_bits: int | None = None
     group_quant_group_size: int | None = None
+    w2_packed_scale: torch.Tensor | None = None
+    group_quant_k_group_sizes: tuple[int, int] | None = None
 
     @property
     def has_group_quant(self) -> bool:
@@ -93,6 +95,7 @@ class MoEFusedExpertsInput:
     need_trans: bool = False
     dynamic_eplb: bool = False
     swiglu_limit: float = 0.0
+    use_early_combine_prep: bool = False
 
 
 @dataclass(frozen=True, slots=True)

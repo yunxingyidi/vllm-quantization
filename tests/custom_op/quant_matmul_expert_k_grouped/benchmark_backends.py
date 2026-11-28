@@ -2,7 +2,7 @@
 
 Packing and golden calculation are outside timed regions unless --include-pack
 explicitly includes activation packing with the custom call.
-Native is a comparison backend and only supports one K group here.
+Native INT8 and BF16 comparisons use one full-K group here.
 """
 from __future__ import annotations
 
@@ -60,6 +60,20 @@ def golden(x_q, weight_q, counts, weight_scale, x_scale):
     return y.to(torch.bfloat16)
 
 
+def golden_bf16(x, weight, counts):
+    """Reference for the rounded BF16 operands used by the native backend."""
+    x = x.cpu().double()
+    weight = weight.cpu()
+    y = torch.empty((x.shape[0], weight.shape[2]), dtype=torch.float64)
+    start = 0
+    for expert, count in enumerate(counts.tolist()):
+        end = start + count
+        if count:
+            y[start:end] = x[start:end] @ weight[expert].double()
+        start = end
+    return y.to(torch.bfloat16)
+
+
 def measure(fn, warmup: int, iters: int, repeats: int, capture: bool):
     for _ in range(warmup):
         fn()
@@ -86,7 +100,7 @@ def measure(fn, warmup: int, iters: int, repeats: int, capture: bool):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=("custom", "native"), default="custom")
+    parser.add_argument("--backend", choices=("custom", "native", "bf16"), default="custom")
     parser.add_argument("--dual-aiv", type=int, choices=(0, 1), default=0)
     parser.add_argument("--m", type=int, default=257)
     parser.add_argument("--k", type=int, default=384)
@@ -96,6 +110,7 @@ def main():
     parser.add_argument("--routing", choices=("uniform", "sparse", "hotspot"), default="uniform")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--scale-values", choices=("bf16", "fp32"), default="bf16")
+    parser.add_argument("--custom-weight-scale-dtype", choices=("bf16", "fp32"), default="fp32")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--repeats", type=int, default=3)
@@ -110,9 +125,9 @@ def main():
     if min(args.m, args.k, args.n, args.experts, args.group_size,
            args.warmup, args.iters, args.repeats) <= 0:
         parser.error("shapes and iteration counts must be positive")
-    if args.backend == "native" and args.group_size != args.k:
-        parser.error("native comparison requires a single full-K group")
-    if args.backend == "native" and args.dual_aiv:
+    if args.backend != "custom" and args.group_size != args.k:
+        parser.error("BF16 and native INT8 comparisons require a single full-K group")
+    if args.backend != "custom" and args.dual_aiv:
         parser.error("--dual-aiv applies only to the custom backend")
     if args.backend == "native" and args.scale_values != "bf16":
         parser.error("native BF16 output requires BF16-representable scale values")
@@ -137,6 +152,8 @@ def main():
     device_counts = counts.to(xq.device)
     if args.backend == "custom":
         load_torch_adapter()
+        if args.custom_weight_scale_dtype == "bf16":
+            ws = ws.to(torch.bfloat16)
         groups = args.k // args.group_size
         # Reconstruct the row-major producer output outside the timed region.
         xnd = xq.view(groups, args.m, args.group_size).permute(1, 0, 2).contiguous()
@@ -148,7 +165,7 @@ def main():
                 wnz, device_counts, ws, sx)
         else:
             fn = lambda: run_custom(xq, wnz, device_counts, ws, sx)
-    else:
+    elif args.backend == "native":
         # Exactly the same qweight values; only the static NZ ABI differs.
         native_weight = torch_npu.npu_format_cast(wq.transpose(1, 2).contiguous(), 29)
         native_scale = ws[:, 0].to(torch.bfloat16).contiguous()
@@ -160,12 +177,27 @@ def main():
                 split_item=3, group_type=0, group_list_type=1,
                 output_dtype=torch.bfloat16,
             )[0]
+    else:
+        # Match the serving BF16 GMM2 ABI with dense [E, K, N] weights.
+        # Dequantize the shared inputs before timing or capturing the graph.
+        x_bf16 = (xq.float() * sx.reshape(-1, 1)).to(torch.bfloat16)
+        weight_bf16 = (wq.float() * ws[:, 0, :, None]).to(torch.bfloat16)
+        weight_bf16 = weight_bf16.transpose(1, 2).contiguous()
+
+        def fn():
+            return torch_npu.npu_grouped_matmul(
+                x=[x_bf16], weight=[weight_bf16], group_list=device_counts,
+                split_item=2, group_type=0, group_list_type=1,
+            )[0]
 
     output = fn()
     torch.npu.synchronize()
     precision = "skipped"
     if not args.perf_only:
-        reference = golden(xq, wq, counts, ws, sx)
+        if args.backend == "bf16":
+            reference = golden_bf16(x_bf16, weight_bf16, counts)
+        else:
+            reference = golden(xq, wq, counts, ws, sx)
         actual = output.cpu()
         assert actual.dtype == torch.bfloat16
         assert actual.shape == reference.shape
@@ -182,12 +214,15 @@ def main():
                   "experts": args.experts, "group_size": args.group_size},
         "routing": args.routing, "seed": args.seed, "graph": args.graph,
         "scale_values": args.scale_values,
+        "weight_scale_dtype": str(
+            native_scale.dtype if args.backend == "native" else ws.dtype
+        ),
         "precision": precision, "warmup": args.warmup, "iters": args.iters,
         "tiling_env": {key: value for key, value in os.environ.items()
                        if key.startswith("GROUP_QUANT_GMM2_")},
         **measure(fn, args.warmup, args.iters, args.repeats, args.graph),
     }
-    from tests.performance.profile_operator_pair import capture_operator
+    from tests.custom_op.profile_operator_pair import capture_operator
     capture_operator(fn)
     if args.result:
         args.result.parent.mkdir(parents=True, exist_ok=True)

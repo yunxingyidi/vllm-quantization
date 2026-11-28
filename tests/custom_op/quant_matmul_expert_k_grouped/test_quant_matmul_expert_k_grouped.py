@@ -109,17 +109,19 @@ def run_fallback(x_q, weight_q, group_list, weight_scale, x_scale, group_size):
     return torch.cat(outputs, dim=0).to(torch.bfloat16)
 
 
-def run_custom(x_q, weight_nz, group_list, weight_scale, x_scale):
+def run_custom(x_q, weight_nz, group_list, weight_scale, x_scale, *, cumulative=False):
     m = x_q.shape[0] if x_q.dim() == 3 else x_q.shape[0] // weight_scale.shape[1]
     if x_scale.numel() != m:
         raise ValueError(f"x_scale must be native per-token [M={m}].")
-    return torch.ops._C_ascend.quant_matmul_expert_k_grouped(
+    args = (
         x_q.contiguous(),
         weight_nz.contiguous(),
         group_list.contiguous(),
         weight_scale.reshape(-1, weight_scale.shape[-1]).contiguous(),
         x_scale.reshape(-1).contiguous(),
     )
+    op = torch.ops._C_ascend.quant_matmul_expert_k_grouped
+    return op(*args, cumulative_group_list=True) if cumulative else op(*args)
 
 
 def benchmark(fn, warmup: int, iters: int) -> float:

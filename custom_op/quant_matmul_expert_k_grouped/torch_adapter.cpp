@@ -99,7 +99,8 @@ at::Tensor quant_matmul_expert_k_grouped(
     const at::Tensor &weight,
     const at::Tensor &group_list,
     const at::Tensor &weight_scale,
-    const at::Tensor &x_scale)
+    const at::Tensor &x_scale,
+    bool cumulative_group_list)
 {
     TORCH_CHECK(x.dim() == 2 || x.dim() == 3,
                 "x must be packed [G*M,S] or ND [M,G,S].");
@@ -112,7 +113,8 @@ at::Tensor quant_matmul_expert_k_grouped(
     TORCH_CHECK(x.scalar_type() == at::kChar, "x must be int8.");
     TORCH_CHECK(weight.scalar_type() == at::kChar, "weight must be int8.");
     TORCH_CHECK(group_list.scalar_type() == at::kLong, "group_list must be int64.");
-    TORCH_CHECK(weight_scale.scalar_type() == at::kFloat, "weight_scale must be float32.");
+    TORCH_CHECK(weight_scale.scalar_type() == at::kFloat || weight_scale.scalar_type() == at::kBFloat16,
+                "weight_scale must be float32 or bfloat16.");
     TORCH_CHECK(x_scale.scalar_type() == at::kFloat, "x_scale must be float32.");
     TORCH_CHECK(x.device() == weight.device() && x.device() == group_list.device() &&
                     x.device() == weight_scale.device() && x.device() == x_scale.device(),
@@ -138,11 +140,14 @@ at::Tensor quant_matmul_expert_k_grouped(
     TORCH_CHECK(x_scale.dim() == 1 && x_scale.numel() == m,
                 "x_scale must be native per-token [M].");
     auto output = at::empty({m, n}, x.options().dtype(at::kBFloat16));
+    // A view distinguishes the formats in CANN's tiling cache without
+    // copying routing data or launching an NPU operator.
+    auto routing = cumulative_group_list ? group_list.unsqueeze(-1) : group_list;
     EXEC_VLLM_SMOOTH_NPU_CMD(
         aclnnQuantMatmulExpertKGrouped,
         x,
         weight,
-        group_list,
+        routing,
         weight_scale,
         x_scale,
         output);
@@ -153,7 +158,7 @@ at::Tensor quant_matmul_expert_k_grouped(
 TORCH_LIBRARY_FRAGMENT(_C_ascend, ops)
 {
     ops.def("quant_matmul_expert_k_grouped(Tensor x, Tensor weight, Tensor group_list, "
-            "Tensor weight_scale, Tensor x_scale) -> Tensor");
+            "Tensor weight_scale, Tensor x_scale, bool cumulative_group_list=False) -> Tensor");
     ops.impl("quant_matmul_expert_k_grouped", torch::kPrivateUse1,
              &vllm_smooth::quant_matmul_expert_k_grouped);
 }

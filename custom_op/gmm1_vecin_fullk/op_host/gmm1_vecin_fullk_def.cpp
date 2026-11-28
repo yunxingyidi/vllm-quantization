@@ -19,6 +19,7 @@ public:
         config.DynamicCompileStaticFlag(true).DynamicFormatFlag(true).DynamicShapeSupportFlag(true)
             .NeedCheckSupportFlag(false).PrecisionReduceFlag(true);
         this->AICore().AddConfig("ascend910b", config);
+        this->AICore().AddConfig("ascend910_93", config);
     }
 };
 OP_ADD(Gmm1VecinFullk);

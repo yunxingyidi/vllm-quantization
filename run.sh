@@ -9,10 +9,14 @@ cd "${repo_root}"
 # per-token activation scales; weight scales remain K-grouped.
 # GMM1 automatically uses native full-K or custom NZ/M32; GMM2 uses dual AIV.
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-4,5}"
-source "${repo_root}/env_vllm_ascend.sh"
+source "${repo_root}/env_vllm_ascend.sh" || exit $?
 set -euo pipefail
 
-model_path="${MODEL_PATH:-/storage2/Qwen3-30B-A3B/}"
+default_model_path=/storage2/Qwen3-30B-A3B/
+if [[ ! -r "${default_model_path}/config.json" && -r /data/models/Qwen/Qwen3-30B-A3B/config.json ]]; then
+    default_model_path=/data/models/Qwen/Qwen3-30B-A3B
+fi
+model_path="${MODEL_PATH:-${default_model_path}}"
 dataset="${DATASET:-wikitext2}"
 seqlen="${SEQLEN:-2048}"
 max_windows="${MAX_WINDOWS:-100}"
@@ -50,7 +54,8 @@ if [[ "${enforce_eager}" == "1" ]]; then
 fi
 
 quant_args=(--quantization group_quant --quantize-moe --no-quantize-linear --expert-gmm2-op --residual-group "${group_size}")
-default_gpu_memory_utilization=0.98
+# Leave memory for TP logprob gathering after the KV cache is allocated.
+default_gpu_memory_utilization=0.90
 
 parallel_args=()
 if [[ "${ENABLE_EXPERT_PARALLEL:-0}" == "1" ]]; then

@@ -42,7 +42,7 @@ vLLM-Ascend 修改集成时冲突面集中在 MoE quant method 和 comm method �
 | `moe_runtime_args.py`, `moe_stage_contracts.py` | vLLM-Ascend typed MoE ABI 兼容 | 必需 |
 | `custom_linear_quant.py`, `group_quant_linear_scheme.py` | 共用量化/打包函数；兼容可选 Linear | 保留，但默认不启用 Linear |
 | `custom_op/` 三个 registry 算子 | 生产计算内核 | 必需 |
-| `ppl_eval.py`, `tests/ppl_data.py`, `run.sh` | PPL/吞吐回归 | 建议保留 |
+| `ppl_eval.py`, `ppl_data.py`, `run.sh` | PPL 回归 | 建议保留 |
 
 ## 4. 集成方式 A：低冲突运行时插件
 
@@ -89,13 +89,14 @@ vLLM-Ascend 修改集成时冲突面集中在 MoE quant method 和 comm method �
 ## 6. 验证门槛
 
 ```bash
-python -m tests.test_groupquant_moe_reference
 bash custom_op/scripts/build_groupquant_moe_fused.sh
-python -m tests.test_groupquant_moe_twostage
 MAX_WINDOWS=1 MODEL_PATH=/path/to/model bash run.sh
 PPL_RESULT_PATH=/tmp/groupquant_100w.json \
   MAX_WINDOWS=100 MODEL_PATH=/path/to/model bash run.sh
 ```
+
+有本机测试脚本时，可运行 `python -m tests.test_groupquant_moe_reference` 和
+`python -m tests.test_groupquant_moe_twostage` 检查 MoE 参考实现和两阶段路径。
 
 验收要求：测试通过、无 fallback warning、PPL 与保存结果一致、吞吐以至少两次均值
 比较。先固定模型、数据、TP、batch、window 数和 ACL Graph，再判断性能变化。

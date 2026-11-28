@@ -17,7 +17,7 @@ run_case() {
   shift
   local log_path="${log_dir}/${name}.log"
   echo "[ST] ${name}"
-  timeout 180s "${python_bin}" -m tests.test_groupquant_gmm_swiglu_op "$@" > "${log_path}" 2>&1
+  timeout 180s "${python_bin}" -m tests.custom_op.grouped_matmul_swiglu_quant_weight_nz_tensor_list.test_groupquant_gmm_swiglu_op "$@" > "${log_path}" 2>&1
   grep -q "quant_output_equal=True" "${log_path}"
   grep -E "config:|quant_output_equal|scale_mean_abs_diff|scale_max_abs_diff|avg_latency_ms" "${log_path}" | tail -n 8
 }
@@ -26,7 +26,7 @@ run_expected_bf16_reject() {
   local log_path="${log_dir}/bf16_reject.log"
   echo "[ST] bf16_reject"
   set +e
-  timeout 180s "${python_bin}" -m tests.test_groupquant_gmm_swiglu_op \
+  timeout 180s "${python_bin}" -m tests.custom_op.grouped_matmul_swiglu_quant_weight_nz_tensor_list.test_groupquant_gmm_swiglu_op \
     --m 2 --k 512 --n 256 --experts 2 --group-size 128 \
     --scale-dtype bf16 --warmup 0 --iters 1 > "${log_path}" 2>&1
   local rc=$?

@@ -30,10 +30,10 @@ def _wikitext2(model: str):
         )
     )
     if root.exists():
-        data = load_from_disk(str(root), "default")
+        data = load_from_disk(str(root))
     else:
-        data = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-    return _tokenizer(model)("\n\n".join(data["text"]), return_tensors="pt")
+        data = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
+    return _tokenizer(model)("\n\n".join(data["text"]), return_tensors="pt", verbose=False)
 
 
 def _ptb(model: str, split: str, separator: str):

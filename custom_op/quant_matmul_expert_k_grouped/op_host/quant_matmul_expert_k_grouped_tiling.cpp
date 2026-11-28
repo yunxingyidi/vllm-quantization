@@ -26,7 +26,7 @@ struct CompileInfo {
     uint64_t sysWorkspaceSize = 0;
 };
 
-uint32_t ReadEnvUint(const char *name, uint32_t defaultValue)
+uint32_t ReadEnvUint(const char *name, uint32_t defaultValue, bool allowZero = false)
 {
     const char *value = std::getenv(name);
     if (value == nullptr || value[0] == '\0') {
@@ -34,7 +34,7 @@ uint32_t ReadEnvUint(const char *name, uint32_t defaultValue)
     }
     char *end = nullptr;
     const unsigned long parsed = std::strtoul(value, &end, 10);
-    if (end == value || *end != '\0' || parsed == 0 || parsed > UINT32_MAX) {
+    if (end == value || *end != '\0' || (!allowZero && parsed == 0) || parsed > UINT32_MAX) {
         return defaultValue;
     }
     return static_cast<uint32_t>(parsed);
@@ -58,8 +58,9 @@ ge::graphStatus TilingFunc(gert::TilingContext *context)
     const auto &groupListShape = groupList->GetStorageShape();
     const auto &weightScaleShape = weightScale->GetStorageShape();
     const auto &xScaleShape = xScale->GetStorageShape();
+    const bool cumulativeGroupList = groupListShape.GetDimNum() == 2 && groupListShape.GetDim(1) == 1;
     if ((xShape.GetDimNum() != 2 && xShape.GetDimNum() != 3) || weightShape.GetDimNum() != 1 ||
-        groupListShape.GetDimNum() != 1 || weightScaleShape.GetDimNum() != 2 ||
+        (groupListShape.GetDimNum() != 1 && !cumulativeGroupList) || weightScaleShape.GetDimNum() != 2 ||
         xScaleShape.GetDimNum() != 1) {
         return ge::GRAPH_FAILED;
     }
@@ -101,7 +102,12 @@ ge::graphStatus TilingFunc(gert::TilingContext *context)
     // restoring the full M*N INT32 workspace.
     // Both binaries are emitted from the same operator package; the runtime
     // switch makes precision/performance A/B reversible without rebuilding.
-    const bool useVecinInt32 =
+    const auto *weightScaleDesc = context->GetInputDesc(WEIGHT_SCALE_INDEX);
+    if (weightScaleDesc == nullptr) {
+        return ge::GRAPH_FAILED;
+    }
+    const bool bf16WeightScale = weightScaleDesc->GetDataType() == ge::DT_BF16;
+    const bool useVecinInt32 = !bf16WeightScale &&
         ReadEnvUint("GROUP_QUANT_GMM2_LOCAL_INT32", 0) != 0;
     // The experimental local-int32 template has a different A-address path.
     if (ndInput && useVecinInt32) {
@@ -120,6 +126,13 @@ ge::graphStatus TilingFunc(gert::TilingContext *context)
     baseM = std::max<uint32_t>(16, (baseM / 16) * 16);
     baseN = std::max<uint32_t>(32, (baseN / 32) * 32);
     baseK = std::max<uint32_t>(16, (baseK / 16) * 16);
+    constexpr uint32_t batchedBaseN = 256;
+    const bool batchExpertNTiles = !useVecinInt32 && kGroupNum == 1 &&
+        m <= std::min(baseM, BASE_M) && n > batchedBaseN && n % batchedBaseN == 0 &&
+        ReadEnvUint("GROUP_QUANT_GMM2_BATCH_EXPERT_N_TILES", 0) != 0;
+    if (batchExpertNTiles) {
+        baseN = batchedBaseN;
+    }
     // Keep the Cube base tile independent from the AIC/AIV hand-off tile.
     // A larger logical M tile lets one cross-core flag cover several baseM
     // matmul iterations, while the Matmul API still uses baseM x baseN.
@@ -142,12 +155,15 @@ ge::graphStatus TilingFunc(gert::TilingContext *context)
     tilingData.set_enableTilePipeline(enableTilePipeline);
     tilingData.set_tileDynamicSchedule(0);
     tilingData.set_reserved0(singleM);
-    tilingData.set_reserved1(std::min<uint32_t>(
-        ReadEnvUint("GROUP_QUANT_GMM2_EXPERT_M_OUTER", 0), 1));
+    const bool streamExpertTiles = ReadEnvUint("GROUP_QUANT_GMM2_STREAM_EXPERT_TILES", 0) != 0;
+    const bool expertMOuter = ReadEnvUint("GROUP_QUANT_GMM2_EXPERT_M_OUTER", 0) != 0;
+    const uint32_t expertSchedule = streamExpertTiles ? 2U : static_cast<uint32_t>(expertMOuter);
+    const bool dualAiv = ReadEnvUint("GROUP_QUANT_GMM2_DUAL_AIV", 1, true) != 0;
     // Keep the legacy single-consumer epilogue selectable in the same binary.
-    // The 1:1 local-int32 template has its own epilogue and ignores this field.
-    tilingData.set_reserved2(useVecinInt32 ? 0 : std::min<uint32_t>(
-        ReadEnvUint("GROUP_QUANT_GMM2_DUAL_AIV", 1), 1) | (ndInput ? 2U : 0U));
+    const uint32_t workspacePipelineFlags =
+        (dualAiv ? 1U : 0U) | (ndInput ? 2U : 0U) | (bf16WeightScale ? 4U : 0U);
+    tilingData.set_reserved2((useVecinInt32 ? 0U : workspacePipelineFlags) |
+        (cumulativeGroupList ? 8U : 0U));
 
     auto platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
     matmul_tiling::MultiCoreMatmulTiling mmTiling(platform);
@@ -169,6 +185,8 @@ ge::graphStatus TilingFunc(gert::TilingContext *context)
     if (mmTiling.GetTiling(tilingData.mmTilingData) == -1) {
         return ge::GRAPH_FAILED;
     }
+    const bool useBatchedSchedule = batchExpertNTiles && tilingData.mmTilingData.get_baseM() >= m;
+    tilingData.set_reserved1(useBatchedSchedule ? 3U : expertSchedule);
     tilingData.mmTilingData.set_dbL0C(1);
     tilingData.mmTilingData.set_stepKa(4);
     tilingData.mmTilingData.set_stepKb(4);
@@ -188,7 +206,9 @@ ge::graphStatus TilingFunc(gert::TilingContext *context)
         sizeof(int32_t) * coreNum;
     workspaceSizes[0] = compileInfo->sysWorkspaceSize +
         (useVecinInt32 ? localPipelineWorkspace : mmWorkspace);
-    context->SetTilingKey(useVecinInt32 ? 1 : 0);
+    // Key 2 keeps the batched GM workspace pipeline with one physical AIV.
+    const uint64_t tilingKey = useVecinInt32 ? 1 : (useBatchedSchedule && !dualAiv ? 2 : 0);
+    context->SetTilingKey(tilingKey);
     context->SetBlockDim(coreNum);
     tilingData.SaveToBuffer(context->GetRawTilingData()->GetData(),
                             context->GetRawTilingData()->GetCapacity());

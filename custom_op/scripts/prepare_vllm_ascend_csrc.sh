@@ -11,6 +11,12 @@ if [[ ! -f "${vllm_ascend_csrc}/build.sh" ]]; then
     exit 1
 fi
 
+patch_source="${vllm_ascend_csrc}/cmake/third_party/build/modules/patch"
+if [[ ! -f "${patch_source}/protobuf_25.1_change_version.patch" ]]; then
+    echo "VLLM_ASCEND_CSRC requires the operator packaging tree with protobuf patches: ${patch_source}" >&2
+    exit 1
+fi
+
 if [[ ! -f "${build_root}/build.sh" ]]; then
     mkdir -p "${build_root}"
     # Leading slashes limit these exclusions to generated directories at the
@@ -19,23 +25,20 @@ if [[ ! -f "${build_root}/build.sh" ]]; then
     rsync -a \
         --exclude '/build/' \
         --exclude '/build_out/' \
+        --exclude '/build_cache/' \
         --exclude '/output/' \
+        --exclude '/prepare_build/' \
         "${vllm_ascend_csrc}/" "${build_root}/"
 fi
 
 # Repair build roots created by the old exclusion rule without recopying all
 # source files or overwriting the custom operators staged below gmm/.
-patch_source="${vllm_ascend_csrc}/cmake/third_party/build/modules/patch"
 patch_destination="${build_root}/cmake/third_party/build/modules/patch"
-if [[ ! -f "${patch_source}/protobuf_25.1_change_version.patch" ]]; then
-    echo "Missing protobuf patch in vllm-ascend csrc: ${patch_source}" >&2
-    exit 1
-fi
 mkdir -p "${patch_destination}"
 rsync -a "${patch_source}/" "${patch_destination}/"
 
 # vllm-ascend main currently names ASCEND950, while CANN 8.5.1 does not expose
-# that enum.  For an Ascend 910B build the RegBase set must be empty.  Apply the
+# that enum. Both 910B and 910C use the non-RegBase path. Apply the
 # compatibility change only to the disposable build tree.
 tiling_util="${build_root}/common/src/tiling_base/tiling_util.cpp"
 if grep -q 'SocVersion::ASCEND950' "${tiling_util}"; then

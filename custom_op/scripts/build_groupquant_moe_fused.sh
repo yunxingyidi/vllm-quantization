@@ -9,8 +9,12 @@ gmm2_op="quant_matmul_expert_k_grouped"
 log_path="${1:-/tmp/groupquant_moe_fused_build.log}"
 
 cd "${repo_root}"
-source "${repo_root}/env_vllm_ascend.sh"
+source "${repo_root}/env_vllm_ascend.sh" || exit $?
 set -euo pipefail
+source "${repo_root}/custom_op/scripts/groupquant_soc.sh"
+soc="$(groupquant_build_soc)"
+export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-8}"
+adapter_csrc="${VLLM_ASCEND_ADAPTER_CSRC:-${VLLM_ASCEND_CSRC:-${repo_root}/../vllm-ascend/csrc}}"
 
 bash "${repo_root}/custom_op/scripts/prepare_vllm_ascend_csrc.sh" \
     "${repo_root}" "${build_root}"
@@ -24,15 +28,16 @@ rsync -a --delete "${repo_root}/custom_op/${gmm2_op}/" \
 
 cd "${build_root}"
 rm -rf build prepare_build output build_out
-bash build.sh --pkg --ops="${gmm1_op},${gmm1_vecin_op},${gmm2_op}" --soc=ascend910b \
+bash build.sh --pkg --ops="${gmm1_op},${gmm1_vecin_op},${gmm2_op}" --soc="${soc}" \
+    -j"${CMAKE_BUILD_PARALLEL_LEVEL}" \
     >"${log_path}" 2>&1
 
 bash "${repo_root}/custom_op/scripts/install_groupquant_gmm_swiglu.sh"
 cd "${repo_root}/custom_op/${gmm2_op}"
-VLLM_ASCEND_CSRC="${VLLM_ASCEND_CSRC:-${repo_root}/../vllm-ascend/csrc}" \
+VLLM_ASCEND_CSRC="${adapter_csrc}" \
     python setup.py build_ext
 cd "${repo_root}/custom_op/${gmm1_vecin_op}"
-VLLM_ASCEND_CSRC="${VLLM_ASCEND_CSRC:-${repo_root}/../vllm-ascend/csrc}" \
+VLLM_ASCEND_CSRC="${adapter_csrc}" \
     python setup.py build_ext
 echo "combined build log: ${log_path}"
 echo "built operators: ${gmm1_op}, ${gmm1_vecin_op}, ${gmm2_op}"

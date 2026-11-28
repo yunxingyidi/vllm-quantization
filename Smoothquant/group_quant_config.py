@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +51,14 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
 
 
+@lru_cache(maxsize=4)
+def _load_smoothquant_scales(path: str) -> dict[str, torch.Tensor]:
+    scales = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(scales, dict) or not scales:
+        raise ValueError("SmoothQuant scale file must map MoE layer prefixes to tensors.")
+    return scales
+
+
 class GroupQuantFusedMoEAdapter(FusedMoEMethodBase):
     def __init__(
         self,
@@ -58,8 +67,18 @@ class GroupQuantFusedMoEAdapter(FusedMoEMethodBase):
         layer: torch.nn.Module,
     ) -> None:
         super().__init__(layer.moe_config)
-        del prefix
-        self.quant_method = GroupQuantMoEMethod(quant_config, layer.moe_config)
+        scale = None
+        if quant_config.smoothquant_scale_path is not None:
+            scales = _load_smoothquant_scales(quant_config.smoothquant_scale_path)
+            if prefix not in scales:
+                raise ValueError(f"Missing SmoothQuant scale for MoE layer {prefix!r}.")
+            scale = scales[prefix]
+            if (not isinstance(scale, torch.Tensor) or not scale.is_floating_point()
+                    or scale.ndim != 1 or not bool((torch.isfinite(scale) & (scale > 0)).all())):
+                raise ValueError(f"SmoothQuant scale for {prefix!r} must be a finite positive vector.")
+        self.quant_method = GroupQuantMoEMethod(
+            quant_config, layer.moe_config, smoothquant_scale=scale,
+        )
 
     def create_weights(
         self,
@@ -135,6 +154,7 @@ class GroupQuantConfig(QuantizationConfig):
         quantize_activations: bool = True,
         quantize_moe: bool = False,
         quantize_linear: bool = True,
+        smoothquant_scale_path: str | None = None,
     ):
         super().__init__()
         self.weight_bits = int(weight_bits)
@@ -145,6 +165,10 @@ class GroupQuantConfig(QuantizationConfig):
         self.quantize_activations = bool(quantize_activations)
         self.quantize_moe = bool(quantize_moe)
         self.quantize_linear = bool(quantize_linear)
+        self.smoothquant_scale_path = (
+            str(Path(smoothquant_scale_path).expanduser().resolve())
+            if smoothquant_scale_path else None
+        )
         self._validate()
         # vllm-ascend expects quant_config.quant_description to exist even for
         # custom quant backends. We keep it lightweight here and let our own
@@ -159,9 +183,12 @@ class GroupQuantConfig(QuantizationConfig):
             "quantize_activations": self.quantize_activations,
             "quantize_moe": self.quantize_moe,
             "quantize_linear": self.quantize_linear,
+            "smoothquant_scale_path": self.smoothquant_scale_path,
         }
 
     def _validate(self) -> None:
+        if self.smoothquant_scale_path is not None and not self.quantize_moe:
+            raise ValueError("SmoothQuant scales require quantize_moe=True.")
         if not 2 <= self.weight_bits <= 8:
             raise ValueError(
                 f"weight_bits must be in [2, 8], but got {self.weight_bits}."
@@ -236,6 +263,9 @@ class GroupQuantConfig(QuantizationConfig):
                 config,
                 ["quantize_linear", "linear_quant"],
                 True,
+            ),
+            smoothquant_scale_path=cls.get_from_keys_or(
+                config, ["smoothquant_scale_path"], None,
             ),
         )
 

@@ -59,6 +59,13 @@ htmlcov/
 *.onnx
 *.om
 
+# Local diagnostics kept on the workstation
+/tests/local/
+/tests/performance/*
+!/tests/performance/README.md
+/tests/test_*.py
+/tests/ppl_data.py
+
 # Benchmark results and generated reporting materials
 /tests/artifacts/*
 !/tests/artifacts/README.md

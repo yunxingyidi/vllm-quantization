@@ -11,6 +11,11 @@ Build after sourcing `env_vllm_ascend.sh`:
 
 ```bash
 bash custom_op/dispatch_quant_scatter/run.sh
+```
+
+On workstations with the local benchmark scripts in `tests/performance/`, the comparison can be run with:
+
+```bash
 ASCEND_RT_VISIBLE_DEVICES=5 python tests/performance/benchmark_dispatch_scatter.py \
   --result tests/artifacts/dispatch_quant_scatter_20261031/check.json
 ```

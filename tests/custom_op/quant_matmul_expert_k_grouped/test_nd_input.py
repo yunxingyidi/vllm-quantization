@@ -39,13 +39,18 @@ def main():
         xq, wq, wnz, _, ws, sx = build_inputs(m, k, n, experts, group_size, 1)
         counts = make_counts(m, experts, routing)
         device_counts = counts.to(xq.device)
+        cumulative = counts.cumsum(dim=0).to(xq.device)
         nd = xq.view(k // group_size, m, group_size).permute(1, 0, 2).contiguous()
         packed_output = run_custom(xq, wnz, device_counts, ws, sx).cpu()
         nd_output = run_custom(nd, wnz, device_counts, ws, sx).cpu()
+        packed_cumulative = run_custom(xq, wnz, cumulative, ws, sx, cumulative=True).cpu()
+        nd_cumulative = run_custom(nd, wnz, cumulative, ws, sx, cumulative=True).cpu()
         reference = golden(xq, wq, counts, ws, sx)
         torch.testing.assert_close(packed_output, reference, rtol=2e-2, atol=2e-2)
         torch.testing.assert_close(nd_output, reference, rtol=2e-2, atol=2e-2)
         assert torch.equal(packed_output, nd_output), name
+        assert torch.equal(packed_output, packed_cumulative), name
+        assert torch.equal(nd_output, nd_cumulative), name
         assert torch.isfinite(nd_output).all(), name
         torch.save(
             {"packed": packed_output, "nd": nd_output, "golden": reference},

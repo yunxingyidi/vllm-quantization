@@ -13,9 +13,12 @@ tiling_cpp="${build_op_dir}/op_host/${op_name}_tiling.cpp"
 
 cd "${repo_root}"
 if [[ -f "${repo_root}/env_vllm_ascend.sh" ]]; then
-  source "${repo_root}/env_vllm_ascend.sh"
+  source "${repo_root}/env_vllm_ascend.sh" || exit $?
 fi
 set -euo pipefail
+source "${repo_root}/custom_op/scripts/groupquant_soc.sh"
+soc="$(groupquant_build_soc)"
+export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-8}"
 
 bash "${repo_root}/custom_op/scripts/prepare_vllm_ascend_csrc.sh" \
   "${repo_root}" "${build_root}"
@@ -64,7 +67,8 @@ PY
 fi
 cd "${build_root}"
 rm -rf build prepare_build output build_out
-bash build.sh --pkg --ops="${op_name}" --soc=ascend910b > "${log_path}" 2>&1
+bash build.sh --pkg --ops="${op_name}" --soc="${soc}" \
+  -j"${CMAKE_BUILD_PARALLEL_LEVEL}" > "${log_path}" 2>&1
 "${repo_root}/custom_op/scripts/install_groupquant_gmm_swiglu.sh"
 
 echo "build log: ${log_path}"

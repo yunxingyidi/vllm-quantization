@@ -38,6 +38,7 @@ constexpr uint64_t DYNAMIC_WORKSPACE_GUARD_BYTES = 512;
 constexpr uint32_t BUFFER_NUM = 2;
 constexpr uint32_t SCALAR_TO_MTE3_EVENT_ID = 0;
 constexpr uint32_t LOCAL_GMM2_EPILOGUE_ROWS = 16;
+constexpr uint32_t EXPERT_N_TILES_PER_MATMUL = 4;
 
 __aicore__ inline uint64_t AlignUp64(uint64_t value, uint64_t align)
 {
@@ -100,7 +101,9 @@ public:
 private:
     __aicore__ inline void ProcessMGrouped();
     __aicore__ inline void ProcessKGroupedCompat();
-    __aicore__ inline void ProcessExpertKGroupedCompat();
+    template <bool StreamTiles, bool BatchNTiles = false>
+    __aicore__ inline void ProcessExpertKGrouped();
+    __aicore__ inline void ComputeExpertNTileBatch(MNConfig& mnConfig, uint32_t firstNTile, uint32_t tileCount);
     __aicore__ inline void ProcessExpertKGroupedMOuter();
     __aicore__ inline void ProcessKGroupedMOuter();
     __aicore__ inline void ProcessKGroupedSharedMOuter();
@@ -117,6 +120,7 @@ private:
     __aicore__ inline void PrepareSharedTileDynamicInputs(MNConfig& mnConfig);
     __aicore__ inline void VectorCompute(uint32_t groupIdx, MNConfig& mnConfig);
     __aicore__ inline void VectorComputeKGrouped(MNConfig& mnConfig);
+    template <bool EarlyWorkspaceRelease = false>
     __aicore__ inline void VectorComputeExpertKGrouped(MNConfig& mnConfig);
     __aicore__ inline void VectorComputeKGroupedShared(MNConfig& mnConfig);
     __aicore__ inline void PostCompute();
@@ -126,7 +130,10 @@ private:
                                                      uint32_t groupIdx, uint64_t partialOffset);
     __aicore__ inline uint64_t GetScaleOffset(uint32_t groupIdx, const MNConfig& mnConfig) const;
     __aicore__ inline void EnqueueScale(uint32_t curBaseN, uint64_t scaleOffset);
+    template <typename T>
+    __aicore__ inline void EnqueueScaleCopy(GlobalTensor<T>& scale, uint32_t curBaseN, uint64_t scaleOffset);
     __aicore__ inline void DequeueScale(uint32_t alignBaseN);
+    __aicore__ inline void FreeScale();
     __aicore__ inline uint64_t GetPerTokenScaleOffset(uint32_t groupIdx, MNConfig& mnConfig, uint32_t offsetM) const;
     __aicore__ inline void EnqueuePerTokenScale(
         uint32_t groupIdx, MNConfig& mnConfig, uint32_t curBaseM, uint32_t offsetM);
@@ -140,6 +147,7 @@ private:
     GlobalTensor<int32_t> mmOutGm;
     GlobalTensor<float> accGm;
     GlobalTensor<float> scaleGm;
+    GlobalTensor<bfloat16_t> scaleBf16Gm;
     GlobalTensor<float> perTokenScaleGm;
     GlobalTensor<bfloat16_t> rawXGm;
     GlobalTensor<int8_t> tileXGm;
@@ -156,6 +164,7 @@ private:
     AscendC::TBuf<TPosition::VECCALC> tileRawFloatBuff;
     AscendC::TBuf<TPosition::VECCALC> tileScaleBuff;
     LocalTensor<float> scaleInUb;
+    LocalTensor<bfloat16_t> scaleBf16InUb;
     LocalTensor<float> perTokenScaleInUb;
     LocalTensor<float> dequantMiddleResult;
     LocalTensor<uint8_t> sharedTmpLocal;
@@ -165,6 +174,7 @@ private:
     uint32_t subBlockIdx;
     uint32_t coreIdx;
     uint32_t cubeCount = 0;
+    bool bf16WeightScale = false;
     GM_ADDR tileXWorkspaceAddr = nullptr;
     GM_ADDR tileScaleWorkspaceAddr = nullptr;
     AscendC::TPipe *pipe;
@@ -190,7 +200,12 @@ __aicore__ inline void QuantGroupMatmul::Init(GM_ADDR x, GM_ADDR weight, GM_ADDR
         static_cast<uint64_t>(tilingData->coreNum) * mmWorkspaceGroups;
     accGm.SetGlobalBuffer(
         reinterpret_cast<__gm__ float *>(workspace) + userWorkspaceElems);
-    scaleGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(scale));
+    bf16WeightScale = (tilingData->reserved2 & 4U) != 0;
+    if (bf16WeightScale) {
+        scaleBf16Gm.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(scale));
+    } else {
+        scaleGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(scale));
+    }
     perTokenScaleGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(perTokenScale));
 #if defined(GROUP_QUANT_TILE_DYNAMIC_EXPERIMENT) && defined(GROUP_QUANT_TILE_DYNAMIC_LOCAL_INPUTS)
     rawXGm.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(x));
@@ -229,7 +244,8 @@ __aicore__ inline void QuantGroupMatmul::InitUbBuffer()
     if ASCEND_IS_AIC {
         return;
     }
-    pipe->InitBuffer(scaleInQueue, BUFFER_NUM, tiling->mmTilingData.baseN * sizeof(float));
+    const uint32_t scaleBytes = bf16WeightScale ? sizeof(bfloat16_t) : sizeof(float);
+    pipe->InitBuffer(scaleInQueue, BUFFER_NUM, tiling->mmTilingData.baseN * scaleBytes);
     pipe->InitBuffer(perTokenScaleInQueue, BUFFER_NUM, tiling->mmTilingData.baseM * sizeof(float));
     pipe->InitBuffer(vecInQueue, BUFFER_NUM, tiling->ubCalSize * sizeof(cT::T));
     pipe->InitBuffer(vecOutQueue, BUFFER_NUM, tiling->ubCalSize * sizeof(bfloat16_t));
@@ -257,11 +273,15 @@ __aicore__ inline void QuantGroupMatmul::Process()
         return;
     }
     if (tiling->groupAxis == 2) {
-        if (tiling->reserved1 != 0) {
+        if (tiling->reserved1 == 3) {
+            ProcessExpertKGrouped<true, true>();
+        } else if (tiling->reserved1 == 2) {
+            ProcessExpertKGrouped<true>();
+        } else if (tiling->reserved1 == 1) {
             ProcessExpertKGroupedMOuter();
-            return;
+        } else {
+            ProcessExpertKGrouped<false>();
         }
-        ProcessExpertKGroupedCompat();
         return;
     }
     if (UseTileLocalDynamicInputs()) {
@@ -331,25 +351,47 @@ __aicore__ inline void QuantGroupMatmul::ProcessKGroupedCompat()
     PostCompute();
 }
 
-__aicore__ inline void QuantGroupMatmul::ProcessExpertKGroupedCompat()
+__aicore__ inline uint32_t ReadExpertRows(const GlobalTensor<int64_t>& groupList,
+    uint32_t expert, uint32_t rowStart, bool cumulative)
+{
+    const uint32_t value = static_cast<uint32_t>(groupList.GetValue(expert));
+    return cumulative ? value - rowStart : value;
+}
+
+template <bool StreamTiles, bool BatchNTiles>
+__aicore__ inline void QuantGroupMatmul::ProcessExpertKGrouped()
 {
     MNConfig mnConfig;
     InitMNConfigBase(mnConfig);
     mnConfig.offsetM = 0;
+    const uint32_t nTasks = BatchNTiles
+        ? AscendC::Ceil(mnConfig.blockDimN, EXPERT_N_TILES_PER_MATMUL) : mnConfig.blockDimN;
+    const bool cumulative = (tiling->reserved2 & 8U) != 0;
+    uint32_t nextBlock = coreIdx;
     for (uint32_t expertIdx = 0; expertIdx < tiling->groupNum; ++expertIdx) {
-        const uint32_t expertM = static_cast<uint32_t>(groupListGm.GetValue(expertIdx));
+        const uint32_t expertM = ReadExpertRows(groupListGm, expertIdx, mnConfig.offsetM, cumulative);
         if (expertM == 0) {
             continue;
         }
         mnConfig.expertIdx = expertIdx;
         mnConfig.m = expertM;
-        mnConfig.blockDimM = AscendC::Ceil(mnConfig.m, mnConfig.singleM);
-        const uint32_t curCount = mnConfig.blockDimN * mnConfig.blockDimM;
-        uint32_t curBlock = coreIdx;
+        mnConfig.blockDimM = StreamTiles && expertM <= mnConfig.singleM
+            ? 1U : AscendC::Ceil(expertM, mnConfig.singleM);
+        const uint32_t curCount = nTasks * mnConfig.blockDimM;
+        uint32_t curBlock = StreamTiles ? nextBlock : coreIdx;
 
         while (curBlock < curCount) {
-            mnConfig.mIdx = curBlock / mnConfig.blockDimN;
-            mnConfig.nIdx = curBlock % mnConfig.blockDimN;
+            mnConfig.mIdx = curBlock / nTasks;
+            mnConfig.nIdx = curBlock % nTasks;
+            if constexpr (BatchNTiles) {
+                const uint32_t firstNTile = mnConfig.nIdx * EXPERT_N_TILES_PER_MATMUL;
+                const uint32_t remainingNTiles = mnConfig.blockDimN - firstNTile;
+                const uint32_t tileCount = remainingNTiles < EXPERT_N_TILES_PER_MATMUL
+                    ? remainingNTiles : EXPERT_N_TILES_PER_MATMUL;
+                ComputeExpertNTileBatch(mnConfig, firstNTile, tileCount);
+                curBlock += tiling->coreNum;
+                continue;
+            }
             mnConfig.pipeIdx = cubeCount % tiling->parallNum;
             if ASCEND_IS_AIC {
                 if (tiling->enableTilePipeline != 0) {
@@ -373,9 +415,49 @@ __aicore__ inline void QuantGroupMatmul::ProcessExpertKGroupedCompat()
             }
             curBlock += tiling->coreNum;
         }
+        if constexpr (StreamTiles) {
+            // Carry this core's next tile into the next nonempty expert so
+            // small experts use successive cores without a full-table count.
+            nextBlock = curBlock - curCount;
+        }
         mnConfig.offsetM += expertM;
     }
     PostCompute();
+}
+
+__aicore__ inline void QuantGroupMatmul::ComputeExpertNTileBatch(
+    MNConfig& mnConfig, uint32_t firstNTile, uint32_t tileCount)
+{
+    if ASCEND_IS_AIC {
+        mnConfig.nIdx = firstNTile;
+        const uint32_t n = tileCount * mnConfig.baseN;
+        const uint32_t k = GetLogicalK();
+        mm.SetOrgShape(mnConfig.m, n, k);
+        mm.SetSingleShape(mnConfig.m, n, k);
+        mm.SetTensorA(xGm[GetXOffset(0, mnConfig)]);
+        auto weight = weightGm[GetWeightOffset(0, mnConfig)];
+        weight.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
+        mm.SetTensorB(weight);
+        const uint32_t slotCount = tiling->enableTilePipeline != 0 ? tiling->parallNum : 1;
+        while (mm.Iterate()) {
+            if (cubeCount >= slotCount) {
+                AscendC::CrossCoreWaitFlag(SYNC_AIV_TO_AIC);
+            }
+            const uint64_t slot = (cubeCount % slotCount) * tiling->coreNum + coreIdx;
+            const uint64_t offset = slot * mnConfig.baseN * mnConfig.singleM;
+            mm.GetTensorC(mmOutGm[offset], 0, true);
+            AscendC::CrossCoreSetFlag<2, PIPE_FIX>(SYNC_AIC_TO_AIV);
+            ++cubeCount;
+        }
+    }
+    if ASCEND_IS_AIV {
+        for (uint32_t tile = 0; tile < tileCount; ++tile) {
+            mnConfig.nIdx = firstNTile + tile;
+            mnConfig.pipeIdx = cubeCount % tiling->parallNum;
+            VectorComputeExpertKGrouped<true>(mnConfig);
+            ++cubeCount;
+        }
+    }
 }
 
 __aicore__ inline void QuantGroupMatmul::ProcessExpertKGroupedMOuter()
@@ -386,9 +468,12 @@ __aicore__ inline void QuantGroupMatmul::ProcessExpertKGroupedMOuter()
     MNConfig mnConfig;
     InitMNConfigBase(mnConfig);
     uint32_t totalMTiles = 0;
+    uint32_t rowsSeen = 0;
+    const bool cumulative = (tiling->reserved2 & 8U) != 0;
     for (uint32_t expertIdx = 0; expertIdx < tiling->groupNum; ++expertIdx) {
-        totalMTiles += AscendC::Ceil(
-            static_cast<uint32_t>(groupListGm.GetValue(expertIdx)), mnConfig.singleM);
+        const uint32_t expertM = ReadExpertRows(groupListGm, expertIdx, rowsSeen, cumulative);
+        totalMTiles += AscendC::Ceil(expertM, mnConfig.singleM);
+        rowsSeen += expertM;
     }
     // Interleave expert M tiles globally. Serially assigning an expert to all
     // cores leaves cores idle for small per-expert M; this keeps the M-outer
@@ -399,7 +484,7 @@ __aicore__ inline void QuantGroupMatmul::ProcessExpertKGroupedMOuter()
         uint32_t offsetM = 0;
         uint32_t expertM = 0;
         for (; expertIdx < tiling->groupNum; ++expertIdx) {
-            expertM = static_cast<uint32_t>(groupListGm.GetValue(expertIdx));
+            expertM = ReadExpertRows(groupListGm, expertIdx, offsetM, cumulative);
             const uint32_t expertTiles = AscendC::Ceil(expertM, mnConfig.singleM);
             if (remaining < expertTiles) {
                 break;
@@ -988,7 +1073,7 @@ __aicore__ inline void QuantGroupMatmul::VectorCompute(uint32_t groupIdx, MNConf
                 vecOutQueue.FreeTensor(yLocal);
             }
         }
-        scaleInQueue.FreeTensor(scaleInUb);
+        FreeScale();
     }
     AscendC::CrossCoreSetFlag<2, PIPE_MTE3>(SYNC_AIV_TO_AIC);  // 2: mode为2, group内同步
 }
@@ -1074,7 +1159,7 @@ __aicore__ inline void QuantGroupMatmul::VectorComputeKGrouped(MNConfig& mnConfi
                     groupIdx,
                     outOffset + offsetM * tiling->n + offsetN);
                 if (!reuseSingleGroupScale) {
-                    scaleInQueue.FreeTensor(scaleInUb);
+                    FreeScale();
                 }
             }
 
@@ -1084,12 +1169,13 @@ __aicore__ inline void QuantGroupMatmul::VectorComputeKGrouped(MNConfig& mnConfi
             vecOutQueue.FreeTensor(yLocal);
         }
         if (reuseSingleGroupScale) {
-            scaleInQueue.FreeTensor(scaleInUb);
+            FreeScale();
         }
     }
     AscendC::CrossCoreSetFlag<2, PIPE_MTE3>(SYNC_AIV_TO_AIC);
 }
 
+template <bool EarlyWorkspaceRelease>
 __aicore__ inline void QuantGroupMatmul::VectorComputeExpertKGrouped(MNConfig& mnConfig)
 {
     if ASCEND_IS_AIC {
@@ -1108,7 +1194,9 @@ __aicore__ inline void QuantGroupMatmul::VectorComputeExpertKGrouped(MNConfig& m
     uint64_t outOffset = (mnConfig.offsetM + mnConfig.mIdx * mnConfig.singleM) * tiling->n +
                          mnConfig.nIdx * mnConfig.singleN;
 
-    AscendC::CrossCoreWaitFlag(SYNC_AIC_TO_AIV);
+    if constexpr (!EarlyWorkspaceRelease) {
+        AscendC::CrossCoreWaitFlag(SYNC_AIC_TO_AIV);
+    }
     const bool dualAiv = (tiling->reserved2 & 1U) != 0;
     // Both sub-blocks already participate in the group ready/free protocol.
     // Give each a disjoint row interval without changing flag multiplicity.
@@ -1116,7 +1204,12 @@ __aicore__ inline void QuantGroupMatmul::VectorComputeExpertKGrouped(MNConfig& m
     const uint32_t rowBegin = dualAiv && subBlockIdx != 0 ? firstRows : 0;
     const uint32_t rowEnd = dualAiv && subBlockIdx == 0 ? firstRows : curCubeSingleM;
     if ((!dualAiv && subBlockIdx != 0) || rowBegin == rowEnd) {
-        AscendC::CrossCoreSetFlag<2, PIPE_MTE3>(SYNC_AIV_TO_AIC);
+        if constexpr (EarlyWorkspaceRelease) {
+            AscendC::CrossCoreWaitFlag(SYNC_AIC_TO_AIV);
+            AscendC::CrossCoreSetFlag<2, PIPE_MTE2>(SYNC_AIV_TO_AIC);
+        } else {
+            AscendC::CrossCoreSetFlag<2, PIPE_MTE3>(SYNC_AIV_TO_AIC);
+        }
         return;
     }
     for (uint32_t offsetN = 0; offsetN < curCubeSingleN; offsetN += mnConfig.baseN) {
@@ -1132,6 +1225,9 @@ __aicore__ inline void QuantGroupMatmul::VectorComputeExpertKGrouped(MNConfig& m
             const uint64_t scaleOffset = GetScaleOffset(0, mnConfig);
             EnqueueScale(curVecBaseN, scaleOffset + offsetN);
             DequeueScale(alignBaseN);
+        }
+        if constexpr (EarlyWorkspaceRelease) {
+            AscendC::CrossCoreWaitFlag(SYNC_AIC_TO_AIV);
         }
         for (uint32_t offsetM = rowBegin; offsetM < rowEnd; offsetM += vecBaseM) {
             uint32_t curVecBaseM = vecBaseM;
@@ -1165,6 +1261,13 @@ __aicore__ inline void QuantGroupMatmul::VectorComputeExpertKGrouped(MNConfig& m
                 DataCopyPad2D(mmOutLocal, mmOutGm[mmOutOffset + offsetM * curVecBaseN],
                               curVecBaseM, curVecBaseN, curVecBaseN);
                 vecInQueue.EnQue(mmOutLocal);
+                if constexpr (EarlyWorkspaceRelease) {
+                    // The accumulator slot can be reused as soon as this AIV's
+                    // last INT32 read completes. Vector output stays in UB.
+                    if (offsetM + curVecBaseM == rowEnd) {
+                        AscendC::CrossCoreSetFlag<2, PIPE_MTE2>(SYNC_AIV_TO_AIC);
+                    }
+                }
                 ComputeDequantAndActivate(
                     mnConfig,
                     curVecBaseM,
@@ -1176,7 +1279,7 @@ __aicore__ inline void QuantGroupMatmul::VectorComputeExpertKGrouped(MNConfig& m
                     groupIdx,
                     outOffset + offsetM * tiling->n + offsetN);
                 if (!reuseSingleGroupScale) {
-                    scaleInQueue.FreeTensor(scaleInUb);
+                    FreeScale();
                 }
             }
 
@@ -1186,10 +1289,12 @@ __aicore__ inline void QuantGroupMatmul::VectorComputeExpertKGrouped(MNConfig& m
             vecOutQueue.FreeTensor(yLocal);
         }
         if (reuseSingleGroupScale) {
-            scaleInQueue.FreeTensor(scaleInUb);
+            FreeScale();
         }
     }
-    AscendC::CrossCoreSetFlag<2, PIPE_MTE3>(SYNC_AIV_TO_AIC);
+    if constexpr (!EarlyWorkspaceRelease) {
+        AscendC::CrossCoreSetFlag<2, PIPE_MTE3>(SYNC_AIV_TO_AIC);
+    }
 }
 
 __aicore__ inline void QuantGroupMatmul::VectorComputeKGroupedShared(MNConfig& mnConfig)
@@ -1251,7 +1356,7 @@ __aicore__ inline void QuantGroupMatmul::VectorComputeKGroupedShared(MNConfig& m
                     offsetN,
                     groupIdx,
                     outOffset + offsetM * tiling->n + offsetN);
-                scaleInQueue.FreeTensor(scaleInUb);
+                FreeScale();
             }
 
             LocalTensor<bfloat16_t> yLocal = vecOutQueue.DeQue<bfloat16_t>();
@@ -1289,8 +1394,13 @@ __aicore__ inline void QuantGroupMatmul::ComputeDequantAndActivate(MNConfig& mnC
     uint64_t outOffset, uint32_t offsetN, uint32_t groupIdx, uint64_t partialOffset)
 {
     LocalTensor<int32_t> mmOutInUb = vecInQueue.DeQue<cT::T>();
-    AscendDequant(dequantMiddleResult, mmOutInUb, scaleInUb, sharedTmpLocal,
-                  {curVecBaseM, alignBaseN, curVecBaseN});
+    if (bf16WeightScale) {
+        AscendDequant(dequantMiddleResult, mmOutInUb, scaleBf16InUb, sharedTmpLocal,
+                      {curVecBaseM, alignBaseN, curVecBaseN});
+    } else {
+        AscendDequant(dequantMiddleResult, mmOutInUb, scaleInUb, sharedTmpLocal,
+                      {curVecBaseM, alignBaseN, curVecBaseN});
+    }
     AscendC::PipeBarrier<PIPE_V>();
     vecInQueue.FreeTensor(mmOutInUb);
     // pertoken反量化
@@ -1338,18 +1448,42 @@ __aicore__ inline uint64_t QuantGroupMatmul::GetScaleOffset(
 
 __aicore__ inline void QuantGroupMatmul::EnqueueScale(uint32_t curBaseN, uint64_t scaleOffset)
 {
-    // GM拷贝scale
-    AscendC::DataCopyPadExtParams<float> padParams;
-    AscendC::DataCopyExtParams scaleParams{1, static_cast<uint32_t>(curBaseN * sizeof(float)), 1, 1, 0};
-    LocalTensor<float> scaleLocal = scaleInQueue.AllocTensor<float>();
-    DataCopyPad(scaleLocal, scaleGm[scaleOffset], scaleParams, padParams);
+    if (bf16WeightScale) {
+        EnqueueScaleCopy(scaleBf16Gm, curBaseN, scaleOffset);
+    } else {
+        EnqueueScaleCopy(scaleGm, curBaseN, scaleOffset);
+    }
+}
+
+template <typename T>
+__aicore__ inline void QuantGroupMatmul::EnqueueScaleCopy(
+    GlobalTensor<T>& scale, uint32_t curBaseN, uint64_t scaleOffset)
+{
+    AscendC::DataCopyPadExtParams<T> padParams{};
+    AscendC::DataCopyExtParams scaleParams{1, static_cast<uint32_t>(curBaseN * sizeof(T)), 0, 0, 0};
+    LocalTensor<T> scaleLocal = scaleInQueue.AllocTensor<T>();
+    DataCopyPad(scaleLocal, scale[scaleOffset], scaleParams, padParams);
     scaleInQueue.EnQue(scaleLocal);
 }
 
 __aicore__ inline void QuantGroupMatmul::DequeueScale(uint32_t alignBaseN)
 {
-    scaleInUb = scaleInQueue.DeQue<float>();
-    scaleInUb.SetSize(alignBaseN);
+    if (bf16WeightScale) {
+        scaleBf16InUb = scaleInQueue.DeQue<bfloat16_t>();
+        scaleBf16InUb.SetSize(alignBaseN);
+    } else {
+        scaleInUb = scaleInQueue.DeQue<float>();
+        scaleInUb.SetSize(alignBaseN);
+    }
+}
+
+__aicore__ inline void QuantGroupMatmul::FreeScale()
+{
+    if (bf16WeightScale) {
+        scaleInQueue.FreeTensor(scaleBf16InUb);
+    } else {
+        scaleInQueue.FreeTensor(scaleInUb);
+    }
 }
 
 __aicore__ inline uint64_t QuantGroupMatmul::GetPerTokenScaleOffset(
@@ -1431,6 +1565,21 @@ __aicore__ inline void CleanGmCacheRange(GM_ADDR addr, uint64_t length)
             AscendC::CacheLine::SINGLE_CACHE_LINE,
             AscendC::DcciDst::CACHELINE_OUT>(cacheLineGm[i * AscendC::CACHE_LINE_SIZE]);
     }
+}
+
+__aicore__ inline void RunExpertGmm2GmWorkspace(
+    GM_ADDR x, GM_ADDR weight, GM_ADDR groupList, GM_ADDR scale, GM_ADDR perTokenScale,
+    GM_ADDR y, GM_ADDR workspace, QuantGroupMatmulCustomTilingData& tilingData, AscendC::TPipe& pipe)
+{
+    MT mm;
+    if ASCEND_IS_AIC {
+        mm.SetSubBlockIdx(0);
+        mm.Init(&tilingData.mmTilingData, &pipe);
+    }
+    QuantGroupMatmul op(mm);
+    op.Init(x, weight, nullptr, groupList, scale, perTokenScale, y,
+            AscendC::GetUserWorkspace(workspace), &tilingData, &pipe);
+    op.Process();
 }
 
 extern "C" __global__ __aicore__ void quant_matmul_expert_k_grouped(GM_ADDR x, GM_ADDR weight,
@@ -1636,10 +1785,13 @@ extern "C" __global__ __aicore__ void quant_matmul_expert_k_grouped(GM_ADDR x, G
                 bool hasPendingTile = false;
                 uint32_t tileSequence = 0;
                 uint32_t totalMTiles = 0;
+                uint32_t rowsSeen = 0;
+                const bool cumulative = (data.reserved2 & 8U) != 0;
                 for (uint32_t expert = 0; expert < data.groupNum; ++expert) {
-                    const uint32_t count = static_cast<uint32_t>(groupsGm.GetValue(expert));
+                    const uint32_t count = ReadExpertRows(groupsGm, expert, rowsSeen, cumulative);
                     totalMTiles += (count + data.mmTilingData.baseM - 1) /
                                    data.mmTilingData.baseM;
+                    rowsSeen += count;
                 }
                 for (uint32_t task = core; task < totalMTiles; task += data.coreNum) {
                     uint32_t remaining = task;
@@ -1647,7 +1799,7 @@ extern "C" __global__ __aicore__ void quant_matmul_expert_k_grouped(GM_ADDR x, G
                     uint32_t expert = 0;
                     uint32_t count = 0;
                     for (; expert < data.groupNum; ++expert) {
-                        count = static_cast<uint32_t>(groupsGm.GetValue(expert));
+                        count = ReadExpertRows(groupsGm, expert, rowStart, cumulative);
                         const uint32_t tiles = (count + data.mmTilingData.baseM - 1) /
                                                data.mmTilingData.baseM;
                         if (remaining < tiles) break;
@@ -1693,15 +1845,11 @@ extern "C" __global__ __aicore__ void quant_matmul_expert_k_grouped(GM_ADDR x, G
     }
     if (TILING_KEY_IS(0)) {
         KERNEL_TASK_TYPE(0, KERNEL_TYPE_MIX_AIC_1_2);
-        MT mm;
-        if ASCEND_IS_AIC {
-            mm.SetSubBlockIdx(0);
-            mm.Init(&tilingData.mmTilingData, &tPipe);
-        }
-        QuantGroupMatmul op(mm);
-        op.Init(x, weight, nullptr, groupList, scale, perTokenScale, y,
-                AscendC::GetUserWorkspace(workspace), &tilingData, &tPipe);
-        op.Process();
+        RunExpertGmm2GmWorkspace(x, weight, groupList, scale, perTokenScale, y, workspace, tilingData, tPipe);
+    }
+    if (TILING_KEY_IS(2)) {
+        KERNEL_TASK_TYPE(2, KERNEL_TYPE_MIX_AIC_1_1);
+        RunExpertGmm2GmWorkspace(x, weight, groupList, scale, perTokenScale, y, workspace, tilingData, tPipe);
     }
 }
 

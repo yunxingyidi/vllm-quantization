@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.append(".")
 
-from tests.ppl_data import get_test_loader
+from ppl_data import get_test_loader
 
 
 def build_parser():

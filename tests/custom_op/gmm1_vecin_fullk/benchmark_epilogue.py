@@ -143,7 +143,7 @@ def main():
               "routing": a.routing, "seed": a.seed, "graph": a.graph,
               "precision": precision, "median_ms": statistics.median(samples),
               "samples_ms": samples, "warmup": a.warmup, "iters": a.iters}
-    from tests.performance.profile_operator_pair import capture_operator
+    from tests.custom_op.profile_operator_pair import capture_operator
     capture_operator(fn)
     if a.result:
         a.result.parent.mkdir(parents=True, exist_ok=True)

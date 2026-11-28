@@ -1,8 +1,8 @@
 import os
-import inspect
 import math
 from collections.abc import Callable
 from dataclasses import replace
+from inspect import signature
 from typing import Any
 
 import torch
@@ -18,6 +18,10 @@ from Smoothquant.fuse_moe.moe_comm_method import (
     get_active_moe_comm_method,
     install_group_quant_fused_experts_override,
     uses_typed_fused_experts_contract,
+)
+from Smoothquant.fuse_moe.moe_mlp import (
+    _pack_expert_gmm2_scale,
+    _use_bf16_expert_gmm2_scale,
 )
 from Smoothquant.custom_linear_quant import (
     _group_weight_scale,
@@ -36,6 +40,7 @@ _GROUP_QUANT_EPLB_WEIGHT_NAMES = [
     "w2_weight_e_list",
 ]
 _GROUP_QUANT_EPLB_ADAPTOR_PATCHED = False
+_SELECT_EXPERT_PARAMETERS = signature(select_experts).parameters
 
 
 def _resolve_moe_group_size(last_dim: int, requested_group_size: int) -> int:
@@ -160,9 +165,10 @@ def zero_experts_compute(expert_indices, expert_scales, num_experts,
 class GroupQuantFusedMoEMethod(AscendMoEScheme):
     quant_type: QuantType = QuantType.W8A8
 
-    def __init__(self, quant_config=None, moe=None):
+    def __init__(self, quant_config=None, moe=None, *, smoothquant_scale=None):
         self.quant_config = quant_config
         self.moe = moe
+        self.smoothquant_scale = smoothquant_scale
         self.ep_group = get_ep_group()
         install_group_quant_fused_experts_override()
         _install_group_quant_eplb_adaptor()
@@ -276,8 +282,7 @@ class GroupQuantFusedMoEMethod(AscendMoEScheme):
                 routed_scaling_factor=routed_scaling_factor,
                 e_score_correction_bias=e_score_correction_bias,
             )
-            select_parameters = inspect.signature(select_experts).parameters
-            if "num_logical_experts" in select_parameters:
+            if "num_logical_experts" in _SELECT_EXPERT_PARAMETERS:
                 select_kwargs.update(
                     mix_placement=bool(getattr(layer, "mix_placement", False)),
                     num_logical_experts=router_logits.shape[1],
@@ -295,7 +300,7 @@ class GroupQuantFusedMoEMethod(AscendMoEScheme):
             select_kwargs = {
                 name: value
                 for name, value in select_kwargs.items()
-                if name in select_parameters
+                if name in _SELECT_EXPERT_PARAMETERS
             }
             topk_weights, topk_ids = select_experts(**select_kwargs)
         assert topk_ids is not None and topk_weights is not None
@@ -309,6 +314,12 @@ class GroupQuantFusedMoEMethod(AscendMoEScheme):
         topk_weights = topk_weights.to(self.in_dtype)
         if not getattr(layer, "group_quant_weight_ready", False):
             raise RuntimeError("GroupQuant MoE weights are not ready. Check process_weights_after_loading().")
+        inverse_scale = getattr(layer, "group_quant_smoothquant_inverse_scale", None)
+        if inverse_scale is not None:
+            if pertoken_scale is not None or not x.is_floating_point() or shared_experts is not None:
+                raise ValueError("MoE SmoothQuant requires floating-point routed inputs before activation quantization.")
+            # Router selection and zero-expert handling above use the original x.
+            x = x * inverse_scale
         if self.dynamic_eplb:
             w13_weight_q = layer.w13_weight_q_list
             w13_weight_delta_base = layer.w13_weight_delta_base_list
@@ -340,11 +351,47 @@ class GroupQuantFusedMoEMethod(AscendMoEScheme):
         moe_comm_method = get_active_moe_comm_method()
         if uses_typed_fused_experts_contract():
             from Smoothquant.fuse_moe.moe_runtime_args import (
+                MoEFusedExpertsInput,
+                MoERoutingParams,
                 build_fused_experts_input,
             )
 
-            output = moe_comm_method.fused_experts(
-                fused_experts_input=build_fused_experts_input(
+            packed_scale = getattr(layer, "w2_packed_scale", None)
+            prepared = getattr(layer, "group_quant_moe_payload", None)
+            use_early_combine_prep = getattr(layer, "group_quant_use_early_combine_prep", False)
+            # Parameter replacement or module moves can swap tensor objects.
+            # Rebuild the regular payload for such calls using current weights.
+            if prepared is not None and (
+                prepared[0].w1 is w13_weight_q
+                and prepared[0].w1_scale is w13_fixpipe_scale
+                and prepared[0].w1_weight_delta_base is w13_weight_delta_base
+                and prepared[0].w1_weight_e is w13_weight_e
+                and prepared[0].w2 is w2_weight_q
+                and prepared[0].w2_weight_delta_base is w2_weight_delta_base
+                and prepared[0].w2_weight_e is w2_weight_e
+                and prepared[0].w2_packed_scale is packed_scale
+            ):
+                weights, quant = prepared
+                fused_experts_input = MoEFusedExpertsInput(
+                    hidden_states=x,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    weights=weights,
+                    quant=quant,
+                    routing=MoERoutingParams(
+                        expert_map=expert_map,
+                        global_redundant_expert_num=global_redundant_expert_num,
+                        mc2_mask=mc2_mask,
+                        apply_router_weight_on_input=apply_router_weight_on_input,
+                        log2phy=log2phy,
+                        pertoken_scale=pertoken_scale,
+                    ),
+                    activation=activation,
+                    swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
+                    use_early_combine_prep=use_early_combine_prep,
+                )
+            else:
+                fused_experts_input = build_fused_experts_input(
                     hidden_states=x,
                     topk_weights=topk_weights,
                     topk_ids=topk_ids,
@@ -370,8 +417,10 @@ class GroupQuantFusedMoEMethod(AscendMoEScheme):
                     group_quant_residual_bits=self.quant_config.residual_bits,
                     group_quant_group_size=self.quant_config.residual_group,
                     swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
+                    w2_packed_scale=packed_scale,
+                    use_early_combine_prep=use_early_combine_prep,
                 )
-            )
+            output = moe_comm_method.fused_experts(fused_experts_input=fused_experts_input)
         else:
             output = moe_comm_method.fused_experts(
                 hidden_states=x, topk_weights=topk_weights, topk_ids=topk_ids,
@@ -413,11 +462,27 @@ class GroupQuantFusedMoEMethod(AscendMoEScheme):
         w2_group_size = _resolve_gmm2_group_size(
             layer.w2_weight.shape[-1], self.quant_config.residual_group
         )
+        w13_source = layer.w13_weight.data
+        smoothquant_scale = getattr(self, "smoothquant_scale", None)
+        if smoothquant_scale is not None:
+            if smoothquant_scale.numel() != w13_source.shape[-1]:
+                raise ValueError(
+                    f"MoE SmoothQuant expected {w13_source.shape[-1]} input scales, "
+                    f"got {smoothquant_scale.numel()}."
+                )
+            if getattr(layer, "_shared_experts", None) is not None:
+                raise ValueError("MoE SmoothQuant currently supports routed-only MoE layers.")
+            scale = smoothquant_scale.to(dtype=w13_source.dtype)
+            inverse_scale = scale.float().reciprocal().to(self.in_dtype)
+            if not bool((torch.isfinite(inverse_scale) & (inverse_scale > 0)).all()):
+                raise ValueError("MoE SmoothQuant scales are outside the supported dtype range.")
+            w13_source = w13_source * scale.to(device=w13_source.device)
         try:
             w13_q, w13_delta, w13_e = quantize_weight_last_dim_runtime(
-                weight=layer.w13_weight.data,
+                weight=w13_source,
                 residual_group=w13_group_size,
                 **common_args)
+            del w13_source
             w2_q, w2_delta, w2_e = quantize_weight_last_dim_runtime(
                 weight=layer.w2_weight.data,
                 residual_group=w2_group_size,
@@ -591,12 +656,72 @@ class GroupQuantFusedMoEMethod(AscendMoEScheme):
             ).contiguous()
             layer.w2_weight_q.data = packed_w2
             layer.group_quant_w2_packed = True
+            if (
+                uses_typed_fused_experts_contract()
+                and os.getenv("GROUP_QUANT_GMM2_PREPACK_SCALE", "1") == "1"
+            ):
+                layer.register_buffer(
+                    "w2_packed_scale",
+                    _pack_expert_gmm2_scale(
+                        layer.w2_weight_delta_base.data,
+                        layer.w2_weight_e.data,
+                        self.quant_config.residual_bits,
+                        use_bf16_scale=_use_bf16_expert_gmm2_scale(layer.w2_weight_e),
+                    ),
+                    persistent=False,
+                )
+        if (
+            not self.dynamic_eplb
+            and uses_typed_fused_experts_contract()
+            and os.getenv("GROUP_QUANT_MOE_STATIC_METADATA", "1") == "1"
+        ):
+            from Smoothquant.fuse_moe.moe_runtime_args import MoEQuantParams, MoEWeights
+
+            w1 = getattr(layer, "w13_weight_q_nz_list", None)
+            if w1 is None:
+                w1 = layer.w13_weight_q
+            weights = MoEWeights(
+                w1=w1,
+                w2=layer.w2_weight_q,
+                w1_scale=getattr(layer, "w13_weight_fixpipe_scale", None),
+                w1_weight_q=w1,
+                w1_weight_delta_base=layer.w13_weight_delta_base,
+                w1_weight_e=layer.w13_weight_e,
+                w2_weight_q=layer.w2_weight_q,
+                w2_weight_delta_base=layer.w2_weight_delta_base,
+                w2_weight_e=layer.w2_weight_e,
+                w2_packed_scale=getattr(layer, "w2_packed_scale", None),
+                group_quant_residual_bits=self.quant_config.residual_bits,
+                group_quant_group_size=self.quant_config.residual_group,
+                group_quant_k_group_sizes=(w13_group_size, w2_group_size),
+            )
+            if not weights.has_group_quant:
+                raise ValueError("GroupQuant MoE path requires grouped weight metadata.")
+            layer.group_quant_moe_payload = (weights, MoEQuantParams(quant_type=self.quant_type))
+        if (
+            uses_typed_fused_experts_contract()
+            and os.getenv("GROUP_QUANT_MOE_EARLY_COMBINE_PREP", "1") == "1"
+        ):
+            from vllm_ascend.ops.fused_moe.fused_moe import AscendFusedMoE, AscendSharedFusedMoE
+
+            # Shared experts use combine events to sequence work on another
+            # stream. Only the known routed-only layers can opt out.
+            layer.group_quant_use_early_combine_prep = (
+                type(layer) is AscendFusedMoE
+                or (type(layer) is AscendSharedFusedMoE and layer._shared_experts is None)
+            )
         # BF16 tensors are checkpoint-loading sources only. All runtime paths,
         # including the fallback, reconstruct from GroupQuant state.
         if "w13_weight" in layer._parameters:
             del layer.w13_weight
         if "w2_weight" in layer._parameters:
             del layer.w2_weight
+        if smoothquant_scale is not None:
+            layer.register_buffer(
+                "group_quant_smoothquant_inverse_scale",
+                inverse_scale.to(device=layer.w13_weight_delta_base.device),
+                persistent=False,
+            )
         layer.group_quant_weight_ready = True
 
 

@@ -22,8 +22,8 @@ mkdir -p "${install_vendor}/bin"
 cat > "${install_vendor}/bin/set_env.bash" <<SETENV
 #!/usr/bin/env bash
 _custom_transformer_root="${install_vendor}"
-export LD_LIBRARY_PATH="\${_custom_transformer_root}/op_api/lib:\${_custom_transformer_root}/op_proto/lib/linux/aarch64:\${LD_LIBRARY_PATH}"
-export ASCEND_CUSTOM_OPP_PATH="\${_custom_transformer_root}:\${ASCEND_CUSTOM_OPP_PATH}"
+export LD_LIBRARY_PATH="\${_custom_transformer_root}/op_api/lib:\${_custom_transformer_root}/op_proto/lib/linux/aarch64\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}"
+export ASCEND_CUSTOM_OPP_PATH="\${_custom_transformer_root}\${ASCEND_CUSTOM_OPP_PATH:+:\${ASCEND_CUSTOM_OPP_PATH}}"
 export GROUP_QUANT_CUSTOM_OPAPI_PATH="\${_custom_transformer_root}/op_api/lib/libcust_opapi.so"
 unset _custom_transformer_root
 SETENV

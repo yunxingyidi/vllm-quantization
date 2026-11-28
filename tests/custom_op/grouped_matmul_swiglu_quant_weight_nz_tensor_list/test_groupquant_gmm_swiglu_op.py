@@ -14,7 +14,7 @@ def _import_enable_custom_op():
         from vllm_ascend.utils import enable_custom_op
         return enable_custom_op
     except ModuleNotFoundError:
-        repo_root = Path(__file__).resolve().parent.parent / "vllm-ascend"
+        repo_root = Path(__file__).resolve().parents[3] / "vllm-ascend"
         import sys
 
         sys.path.insert(0, str(repo_root))

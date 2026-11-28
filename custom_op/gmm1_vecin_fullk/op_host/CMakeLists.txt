@@ -17,9 +17,13 @@ endif()
 # NNOP canonicalizes the digit in Gmm1VecinFullk as `gmm_1_vecin_fullk`,
 # while the kernel build directory follows this project's `gmm1_...` name.
 # Ship the canonical alias so ACLNN can locate the generated binary config.
-install(CODE [[
-    set(_config_dir "${CMAKE_INSTALL_PREFIX}/packages/vendors/custom_transformer/op_impl/ai_core/tbe/kernel/config/ascend910b")
-    file(MAKE_DIRECTORY "${_config_dir}")
-    execute_process(COMMAND "${CMAKE_COMMAND}" -E create_symlink
-        gmm1_vecin_fullk.json "${_config_dir}/gmm_1_vecin_fullk.json")
-]])
+string(CONFIGURE [[
+    foreach(_soc IN ITEMS @ASCEND_COMPUTE_UNIT@)
+        if(_soc STREQUAL "ascend910b" OR _soc STREQUAL "ascend910_93")
+            set(_config_dir "${CMAKE_INSTALL_PREFIX}/packages/vendors/custom_transformer/op_impl/ai_core/tbe/kernel/config/${_soc}")
+            file(MAKE_DIRECTORY "${_config_dir}")
+            file(CREATE_LINK gmm1_vecin_fullk.json "${_config_dir}/gmm_1_vecin_fullk.json" SYMBOLIC)
+        endif()
+    endforeach()
+]] _install_binary_alias @ONLY)
+install(CODE "${_install_binary_alias}")

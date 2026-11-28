@@ -2,13 +2,11 @@
 
 | 位置 | 用途 |
 |---|---|
-| test_*.py、conftest.py | GroupQuant数学参考、动态量化、部分和及MoE回归 |
-| custom_op/ | GMM1/GMM2精度、ND输入、多组路径测试和微基准 |
-| performance/ | PPL、HTTP吞吐、显存、设备时间线及激活诊断 |
-| scripts/ | PPL工作负载profiling辅助入口 |
-| ppl_data.py | PPL/真实文本诊断共用数据加载 |
-| artifacts/ | 后续测试输出目录；历史结果已全部清空 |
+| 顶层 `test_*.py` | 本机 GroupQuant 数学参考、动态量化、部分和及 MoE 回归，由 Git 忽略 |
+| `custom_op/` | GMM1/GMM2 精度、ND 输入、多组路径测试和微基准 |
+| `performance/` | [本机 PPL 对照、HTTP 吞吐与 profiling](performance/README.md)，脚本由 Git 忽略 |
+| `local/` | 本机采样、资源排查和历史复现脚本，由 Git 忽略 |
+| `artifacts/` | 本地实验结果、原始 trace、复现实验脚本和汇报图表 |
 
-2026-11-24清理了旧Profiler明细、数据库、日志、tensor、__pycache__和测试build产物。随后再次清空artifacts历史结果，仅保留测试源码和输出说明。
-
-复测入口见performance/README.md，旧报告生成脚本已删除。算子测试run.sh会重新构建所需二进制。NPU测试需先加载env_vllm_ascend.sh并配置可用设备；本次整理没有运行NPU性能回归。
+仓库根目录的 `run.sh` 和 `ppl_eval.py` 提供共享 PPL 入口，使用同目录的 `ppl_data.py`。
+算子目录下的 `run.sh` 会准备对应的测试二进制。NPU 测试前先加载 `env_vllm_ascend.sh` 并配置可用设备。

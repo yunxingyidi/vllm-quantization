@@ -1,24 +1,36 @@
 from __future__ import annotations
 
 import inspect
-from functools import wraps
+import os
+from functools import cache, wraps
 from typing import Any, Optional
 
 import torch
+import torch_npu
 from vllm.forward_context import get_forward_context
 
-from Smoothquant.fuse_moe.moe_mlp import group_quant_apply_mlp, unified_apply_mlp
+from Smoothquant.fuse_moe.moe_mlp import (
+    ASCEND_DEVICE_TYPE,
+    group_quant_apply_mlp,
+    unified_apply_mlp,
+)
 from Smoothquant.fuse_moe import dispatch_quant_scatter
 from vllm_ascend.ops.fused_moe import moe_comm_method as upstream_moe_comm_method
+from vllm_ascend.utils import AscendDeviceType
 
 _GROUP_QUANT_FUSED_EXPERTS_PATCHED = False
 
 
+@cache
+def _signature_parameters(callable_obj):
+    # The override can replace the upstream method. Cache by callable so a
+    # replacement still gets its own ABI check.
+    return inspect.signature(callable_obj).parameters
+
+
 def _build_fused_experts_result(**kwargs):
     """Build the result across the v0.19 and current structured ABIs."""
-    parameters = inspect.signature(
-        upstream_moe_comm_method.FusedExpertsResult
-    ).parameters
+    parameters = _signature_parameters(upstream_moe_comm_method.FusedExpertsResult)
     return upstream_moe_comm_method.FusedExpertsResult(**{
         name: value for name, value in kwargs.items() if name in parameters
     })
@@ -26,9 +38,9 @@ def _build_fused_experts_result(**kwargs):
 
 def uses_typed_fused_experts_contract() -> bool:
     """Return whether the loaded vLLM-Ascend uses MoEFusedExpertsInput."""
-    parameters = inspect.signature(
+    parameters = _signature_parameters(
         upstream_moe_comm_method.MoECommMethod.fused_experts
-    ).parameters
+    )
     return "fused_experts_input" in parameters
 
 
@@ -239,6 +251,13 @@ def _install_typed_override(original_fused_experts) -> None:
     # imports behind the ABI check.
     from Smoothquant.fuse_moe.moe_runtime_args import build_token_dispatch_input
     from Smoothquant.fuse_moe.moe_stage_contracts import MoEFusedExpertsInput
+    from vllm_ascend.ops.fused_moe import token_dispatcher as upstream_dispatch
+
+    use_cumulative_routing = (
+        ASCEND_DEVICE_TYPE == AscendDeviceType.A3
+        and os.getenv("GROUP_QUANT_ROUTING_CUMSUM", "1") == "1"
+        and hasattr(upstream_dispatch, "DeviceOperator")
+    )
 
     @wraps(original_fused_experts)
     def group_quant_aware_fused_experts(self, fused_experts_input):
@@ -247,20 +266,21 @@ def _install_typed_override(original_fused_experts) -> None:
                 self, fused_experts_input=fused_experts_input
             )
         weights = fused_experts_input.weights
-        if not weights.has_group_quant:
-            return original_fused_experts(
-                self, fused_experts_input=fused_experts_input
+        k_group_sizes = weights.group_quant_k_group_sizes
+        if k_group_sizes is None:
+            if not weights.has_group_quant:
+                return original_fused_experts(
+                    self, fused_experts_input=fused_experts_input
+                )
+            _validate_group_quant_metadata(
+                dynamic_eplb=fused_experts_input.dynamic_eplb,
+                w1_weight_delta_base=weights.w1_weight_delta_base,
+                w1_weight_e=weights.w1_weight_e,
+                w2_weight_delta_base=weights.w2_weight_delta_base,
+                w2_weight_e=weights.w2_weight_e,
+                group_quant_residual_bits=weights.group_quant_residual_bits,
+                group_quant_group_size=weights.group_quant_group_size,
             )
-
-        _validate_group_quant_metadata(
-            dynamic_eplb=fused_experts_input.dynamic_eplb,
-            w1_weight_delta_base=weights.w1_weight_delta_base,
-            w1_weight_e=weights.w1_weight_e,
-            w2_weight_delta_base=weights.w2_weight_delta_base,
-            w2_weight_e=weights.w2_weight_e,
-            group_quant_residual_bits=weights.group_quant_residual_bits,
-            group_quant_group_size=weights.group_quant_group_size,
-        )
         before_dispatch_evt = torch.npu.current_stream().record_event()
         routed_topk_ids = fused_experts_input.topk_ids
         if fused_experts_input.routing.log2phy is not None:
@@ -269,9 +289,56 @@ def _install_typed_override(original_fused_experts) -> None:
             fused_experts_input=fused_experts_input,
             topk_ids=routed_topk_ids,
         )
-        dispatch_output = self.token_dispatcher.token_dispatch(
-            token_dispatch_input=dispatch_input
+        dispatcher = self.token_dispatcher
+        routing = dispatch_input.routing
+        hidden = dispatch_input.hidden_states
+        cumulative_routing = (
+            use_cumulative_routing
+            and type(dispatcher) is upstream_dispatch.TokenDispatcherWithAllGather
+            and not fused_experts_input.dynamic_eplb
+            and routing.expert_map is None
+            and routing.pertoken_scale is None
+            and not routing.apply_router_weight_on_input
+            and dispatch_input.quant.is_int_quant
+            and hidden.ndim == 2
+            and 0 < hidden.shape[0] <= 16
         )
+        combine_indices = None
+        if cumulative_routing:
+            # The A3 router supplies prefix sums for both GMMs without a
+            # separate AI CPU Cumsum on every layer.
+            experts = dispatcher.num_experts_local
+            sorted_hidden, row_indices, cumulative, scale = (
+                upstream_dispatch.DeviceOperator.npu_moe_init_routing(
+                    hidden,
+                    dispatch_input.topk_ids,
+                    active_num=hidden.shape[0] * dispatcher.top_k,
+                    expert_num=experts,
+                    expert_tokens_num_type=0,
+                    expert_tokens_num_flag=True,
+                    active_expert_range=[0, experts],
+                    quant_mode=1,
+                )
+            )
+            if fused_experts_input.use_early_combine_prep:
+                # The two-dimensional full-range AllGather route supplies
+                # everything unpermute needs before either GMM runs.
+                combine_indices = row_indices.abs()
+            dispatch_output = upstream_dispatch.MoETokenDispatchOutput(
+                hidden_states=sorted_hidden,
+                dynamic_scale=scale,
+                group_list=cumulative.to(torch.int64),
+                group_list_type=0,
+                combine_metadata=upstream_dispatch.MoEAllGatherCombineMetadata(
+                    topk_weights=dispatch_input.topk_weights,
+                    expanded_row_idx=row_indices,
+                    restore_shape=hidden.shape,
+                ),
+            )
+        else:
+            dispatch_output = dispatcher.token_dispatch(
+                token_dispatch_input=dispatch_input
+            )
         w1 = weights.w1_weight_q
         w2 = weights.w2_weight_q
         assert w1 is not None and w2 is not None
@@ -294,12 +361,22 @@ def _install_typed_override(original_fused_experts) -> None:
             group_quant_residual_bits=weights.group_quant_residual_bits,
             group_quant_group_size=weights.group_quant_group_size,
             swiglu_limit=fused_experts_input.swiglu_limit,
+            w2_packed_scale=weights.w2_packed_scale,
+            k_group_sizes=k_group_sizes,
         )
-        before_combine_evt = torch.npu.current_stream().record_event()
-        routed_out = self.token_dispatcher.token_combine(
-            hidden_states=mlp_output,
-            combine_metadata=dispatch_output.combine_metadata,
-        )
+        before_combine_evt = None
+        if combine_indices is not None:
+            routed_out = torch_npu.npu_moe_token_unpermute(
+                permuted_tokens=mlp_output,
+                sorted_indices=combine_indices,
+                probs=dispatch_output.combine_metadata.topk_weights,
+            )
+        else:
+            before_combine_evt = torch.npu.current_stream().record_event()
+            routed_out = dispatcher.token_combine(
+                hidden_states=mlp_output,
+                combine_metadata=dispatch_output.combine_metadata,
+            )
         return _build_fused_experts_result(
             routed_out=routed_out,
             before_dispatch_evt=before_dispatch_evt,
